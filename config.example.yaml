@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------------------
+# Bronze layer loading tests - configuration
+# ---------------------------------------------------------------------------
+project_id: my-gcp-project
+location: europe-west4            # BigQuery data location, exactly as shown in the
+                                  # dataset details (EU / US / europe-west4 ...)
+report_dir: ./reports
+
+# Connection to the source system only - which table belongs to which bronze
+# table is defined per table below. User and password are NOT kept here: the
+# script asks at startup, or takes ORACLE_USER / ORACLE_PASSWORD from the env.
+oracle:
+  host: oracle-host.example.com
+  port: 1521
+  service_name: ORCLSVC
+
+# Cloud Composer. base_url is the Airflow UI address from the environment
+# details page; authentication uses your gcloud credentials.
+#
+# Composer usually lives in a DIFFERENT project than the data. That needs no
+# setting here - base_url already identifies the environment - but the account
+# running this needs roles/composer.user in THAT project. Leave the ADC quota
+# project pointing at the BigQuery one.
+airflow:
+  enabled: true
+  base_url: https://xxxxxxxx.composer.googleusercontent.com
+  api_version: v2                 # Airflow 3 / Composer 3
+
+  verify_ssl: false               # corporate network inspects TLS
+  # dag_id is built as <dag_id_prefix><dag_prefix><TABLE minus stripped suffix>.
+  # dag_prefix and dag_id_strip_suffixes can also be set per table below, since
+  # the naming differs between source systems. Set dag_id: on a table to bypass
+  # the whole convention.
+  dag_id_prefix: LOAD_
+  dag_id_strip_suffixes: [_TMP]
+  history_runs: 10                # how many recent runs to analyse
+  min_success_ratio_pct: 80
+  duration_factor: 2.0            # WARN if the last run took 2x the average
+
+# Thresholds applied to every table unless overridden per table
+defaults:
+  null_threshold_pct: 5.0         # WARN above this NULL ratio
+  null_fail_threshold_pct: 50.0   # FAIL above this NULL ratio
+  row_count_tolerance_pct: 1.0
+  min_row_count: 1
+  max_load_lag_hours: 24
+  audit_timestamp_column: audit_insert_ts   # DATETIME, partitioning column
+  allow_duplicates: false
+
+  # Counting window. Rows are counted from count_from (inclusive) up to
+  # count_to (exclusive); leaving count_to out means "until now". Both can be
+  # overridden per table below.
+  count_from: 2026-06-01
+  count_to: 2026-08-01
+
+  # The loading checks (freshness, batches, duplicates) use their own window on
+  # the load timestamp - the calendar dates above make no sense there, because a
+  # reloaded table has every row stamped with the day of the reload. Omit all
+  # three and they look at the whole table.
+  # load_window_days: 7
+  # load_from: 2026-08-18
+  # load_to: 2026-08-21
+
+tables:
+  - name: bronze.customers
+    load_type: incremental
+    dag_prefix: SYS_                     # -> LOAD_SYS_CUSTOMERS
+    watermark_column: source_change_ts   # column the increment goes by
+    technical_columns: [audit_insert_ts, source_change_ts]
+    source:
+      system: oracle
+      table: SRC_SCHEMA.CUSTOMERS          # table name in Oracle
+      watermark_column: SOURCE_CHANGE_TS   # same column, Oracle spelling
