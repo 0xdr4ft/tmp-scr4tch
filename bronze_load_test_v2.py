@@ -777,18 +777,22 @@ def oracle_null_counts(cfg: dict, tc: dict,
         return {}, 0
 
     try:
-        owner, _, tbl = table.upper().rpartition(".")
+        # Ask the table itself what its columns are. Reading all_tab_columns
+        # needs the right owner and dictionary privileges, and breaks on
+        # synonyms; a query returning no rows only needs SELECT and always
+        # reports the real column names.
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT column_name FROM all_tab_columns "
-                "WHERE owner = :owner AND table_name = :tbl",
-                owner=owner, tbl=tbl)
-            available = {r[0] for r in cur.fetchall()}
+            cur.execute(f"SELECT * FROM {table} WHERE 1 = 0")
+            available = {d[0].upper() for d in cur.description}
 
         wanted = [c for c in columns if c.upper() in available]
         if not wanted:
-            LOG.warning("None of the bronze columns exist in %s", table)
+            LOG.warning("None of the bronze columns exist in %s (Oracle has: %s)",
+                        table, ", ".join(sorted(available)[:10]) or "nothing")
             return {}, 0
+        missing = [c for c in columns if c.upper() not in available]
+        if missing:
+            LOG.info("Not in Oracle, not compared: %s", ", ".join(missing))
 
         # COUNT(col) skips NULLs, so COUNT(*) - COUNT(col) is the NULL count.
         # Numbered aliases keep us clear of Oracle identifier length limits.
