@@ -69,5 +69,10 @@ tables:
     technical_columns: [audit_insert_ts, source_change_ts]
     source:
       system: oracle
-      table: SRC_SCHEMA.CUSTOMERS          # table name in Oracle
+      # Table the counts run against - usually the local synonym.
+      table: SRC_SCHEMA.CUSTOMERS
+      # Only needed when that synonym hides an object in another schema or
+      # behind a database link: name it in full, so the column names can be
+      # read. Counting still uses `table` above.
+      # columns_table: OWNER.CUSTOMERS@DB_LINK
       watermark_column: SOURCE_CHANGE_TS   # same column, Oracle spelling

@@ -679,7 +679,9 @@ def check_load_correctness(bq: BQ, cfg: dict, tc: dict, rep: TableReport,
 
 _ORACLE_CONN: Any = None            # one connection per run, opened on first use
 _ORACLE_ERROR: Exception | None = None      # remembered so we ask for the password once
-_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$.]*$")
+# Oracle identifiers, optionally schema-qualified and reaching over a database
+# link: OWNER.TABLE@REMOTE_DB.WORLD. No quotes, spaces or semicolons get in.
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#.]*(@[A-Za-z_][A-Za-z0-9_$#.]*)?$")
 
 
 def _oracle_ident(value: str, what: str) -> str:
@@ -767,6 +769,11 @@ def oracle_null_counts(cfg: dict, tc: dict,
     if not src:
         return {}, 0
     table, column = src
+    # Counting runs against `table` (usually the local synonym), but a synonym
+    # can hide the real object behind a database link, and then it tells us
+    # nothing about its columns. columns_table names that object explicitly.
+    cols_table = _oracle_ident(
+        (tc.get("source") or {}).get("columns_table") or table, "columns table name")
 
     try:
         conn = oracle_connect(cfg)
@@ -777,18 +784,18 @@ def oracle_null_counts(cfg: dict, tc: dict,
         return {}, 0
 
     try:
-        # Ask the table itself what its columns are. Reading all_tab_columns
-        # needs the right owner and dictionary privileges, and breaks on
-        # synonyms; a query returning no rows only needs SELECT and always
-        # reports the real column names.
+        # Ask the object itself what its columns are: a query returning no rows
+        # needs only SELECT, and resolves synonyms and database links on its own.
         with conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM {table} WHERE 1 = 0")
+            cur.execute(f"SELECT * FROM {cols_table} WHERE 1 = 0")
             available = {d[0].upper() for d in cur.description}
+        if cols_table != table:
+            LOG.info("Column names read from %s", cols_table)
 
         wanted = [c for c in columns if c.upper() in available]
         if not wanted:
             LOG.warning("None of the bronze columns exist in %s (Oracle has: %s)",
-                        table, ", ".join(sorted(available)[:10]) or "nothing")
+                        cols_table, ", ".join(sorted(available)[:10]) or "nothing")
             return {}, 0
         missing = [c for c in columns if c.upper() not in available]
         if missing:
