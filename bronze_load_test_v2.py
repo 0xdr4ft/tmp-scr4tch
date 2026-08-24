@@ -22,6 +22,14 @@ a `source: system: oracle` block those checks report SKIPPED and the BigQuery
 tests run exactly as before. bronze_load_test.py is the version from before
 this integration.
 
+After a successful Oracle login the script asks which source table to test -
+the bare name, no schema, case does not matter (CUSTOMERS = customers =
+SRC_SCHEMA.CUSTOMERS). Enter runs every table from the config; --table skips
+the question altogether.
+
+Timestamps in the report and the log are Polish local time (Europe/Warsaw);
+everything compared against the data itself stays in UTC.
+
 Usage:
     python bronze_load_test_v2.py --config config.yaml
     python bronze_load_test_v2.py --config config.yaml --table bronze.customers
@@ -53,6 +61,26 @@ except ImportError:  # pragma: no cover
     bigquery = None
 
 LOG = logging.getLogger("bronze_load_test")
+
+# --------------------------------------------------------------------------- #
+# Local time
+# --------------------------------------------------------------------------- #
+
+# Reports and log files are read in Poland, so they carry Polish wall-clock
+# time. Everything compared against BigQuery data stays in UTC - the freshness
+# check subtracts two aware timestamps, and mixing the zones there would move
+# the result by an hour or two.
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ: Any = ZoneInfo("Europe/Warsaw")
+except Exception:                    # no tzdata (Windows without the package)
+    LOCAL_TZ = None
+
+
+def now_local() -> datetime:
+    """Current time in Europe/Warsaw, or the machine's own zone as a fallback."""
+    return datetime.now(LOCAL_TZ) if LOCAL_TZ else datetime.now().astimezone()
+
 
 # --------------------------------------------------------------------------- #
 # Status model
@@ -261,6 +289,47 @@ def oracle_source_of(tc: dict) -> tuple[str, str] | None:
         return None
     column = source.get("watermark_column") or (tc.get("watermark_column") or "").upper()
     return source["table"], column
+
+
+def source_table_key(name: str) -> str:
+    """Bare Oracle table name - no schema, no db link, upper case.
+
+    This is what the user types at the prompt, so `customers`,
+    `SRC_SCHEMA.CUSTOMERS` and `SRC_SCHEMA.CUSTOMERS@DB_LINK` all end up as the
+    same key.
+    """
+    return name.split("@", 1)[0].rsplit(".", 1)[-1].strip().strip('"').upper()
+
+
+def pick_tables_by_source(cfg: dict, tables: list[str]) -> list[str] | None:
+    """Ask which source table to test; map the answer back to the bronze table.
+
+    Returns None when the whole list should run (nothing to choose from, or the
+    user just pressed Enter).
+    """
+    choices: dict[str, list[str]] = {}
+    for t in tables:
+        src = oracle_source_of(table_config(cfg, t))
+        if src:
+            choices.setdefault(source_table_key(src[0]), []).append(t)
+    if not choices:
+        return None
+
+    names = ", ".join(sorted(choices))
+    while True:
+        try:
+            answer = input(f"\nSource table to test [{names}] (Enter = all): ").strip()
+        except EOFError:                 # piped stdin - behave like Enter
+            return None
+        if not answer:
+            return None
+        picked = choices.get(source_table_key(answer))
+        if picked:
+            LOG.info("Testing only the table loaded from %s: %s",
+                     answer.upper(), ", ".join(picked))
+            return picked
+        print(f"  No table in the config is loaded from '{answer}'. "
+              f"Known source tables: {names}")
 
 
 def check_row_count(bq: BQ, cfg: dict, tc: dict, rep: TableReport) -> int:
@@ -1036,7 +1105,7 @@ def render_text(reports: list[TableReport], cfg: dict) -> str:
 
     out = _banner("BRONZE LAYER - LOADING TEST REPORT")
     out += [
-        f" Generated : {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
+        f" Generated : {now_local():%Y-%m-%d %H:%M:%S %Z}",
         f" Project   : {cfg.get('project_id')}",
         f" Location  : {cfg.get('location') or '-'}",
         f" Tables    : {len(reports)}",
@@ -1129,7 +1198,8 @@ def write_report(reports: list[TableReport], cfg: dict, out_dir: str,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Bronze loading tests (BigQuery + Oracle)")
     ap.add_argument("--config", required=True, help="Path to YAML config")
-    ap.add_argument("--table", action="append", help="Table to test (repeatable)")
+    ap.add_argument("--table", action="append",
+                    help="Table to test (repeatable); skips the source-table question")
     ap.add_argument("--out-dir", default=None,
                     help=f"Directory for the report and the log "
                          f"(default: report_dir from the config, else {DEFAULT_OUT_DIR})")
@@ -1140,13 +1210,20 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = args.out_dir or cfg.get("report_dir") or DEFAULT_OUT_DIR
     os.makedirs(out_dir, exist_ok=True)
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stamp = now_local().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(out_dir, f"bronze_test_{stamp}.log")
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8"),
-                  logging.StreamHandler(sys.stdout)])
+    # The formatter carries its own clock: set on the instance, not on
+    # logging.Formatter, where a plain function would be bound as a method and
+    # get `self` as its first argument.
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
+    if LOCAL_TZ:
+        fmt.converter = lambda secs: datetime.fromtimestamp(secs, LOCAL_TZ).timetuple()
+    handlers = [logging.FileHandler(log_path, encoding="utf-8"),
+                logging.StreamHandler(sys.stdout)]
+    for handler in handlers:
+        handler.setFormatter(fmt)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        handlers=handlers)
 
     tables = args.table or [t["name"] for t in cfg.get("tables", [])]
     if not tables:
@@ -1168,6 +1245,13 @@ def main(argv: list[str] | None = None) -> int:
             LOG.error("No tests were run. Fix the credentials or the connection "
                       "and try again.")
             return 2
+
+        # Logged in - now ask which source table to test. Skipped when --table
+        # already says so, and when there is no terminal to ask at (cron).
+        if not args.table and sys.stdin.isatty():
+            picked = pick_tables_by_source(cfg, tables)
+            if picked:
+                tables = picked
 
     bq = BQ(cfg["project_id"], cfg.get("location"))
     reports = []
