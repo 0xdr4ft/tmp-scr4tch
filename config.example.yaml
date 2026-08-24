@@ -4,7 +4,7 @@
 project_id: my-gcp-project
 location: europe-west4            # BigQuery data location, exactly as shown in the
                                   # dataset details (EU / US / europe-west4 ...)
-report_dir: ./reports
+report_dir: ./reports            # where the .txt report and the .log land
 
 # Connection to the source system only - which table belongs to which bronze
 # table is defined per table below. User and password are NOT kept here: the

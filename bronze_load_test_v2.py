@@ -7,10 +7,15 @@ Given a table name, the script checks:
   2) completeness (NULL ratio) of each column
   3) duplicated rows and correctness of full / incremental loading
   4) the Oracle source: row counts agree, nothing left behind in the source
-  5) final test status
+  5) final test status, written as a plain-text report
 
 Every check is limited to the same time window (count_from / count_to in the
 config), filtered on the partitioning column.
+
+The report and the log land in report_dir from the config (./reports by
+default, --out-dir to change it):
+  - bronze_test_<ts>.txt   <-- attach to the Jira task
+  - bronze_test_<ts>.log
 
 The Oracle part is optional: without the driver, without credentials or without
 a `source: system: oracle` block those checks report SKIPPED and the BigQuery
@@ -79,6 +84,8 @@ class TableReport:
     table: str
     load_type: str
     started_at: datetime
+    compare_window: str = ""
+    load_window: str = ""
     results: list[CheckResult] = field(default_factory=list)
     finished_at: datetime | None = None
 
@@ -997,6 +1004,125 @@ def check_airflow(cfg: dict, tc: dict, rep: TableReport) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 6) Report file
+# --------------------------------------------------------------------------- #
+
+SECTIONS = ("Row count", "Completeness", "Loading", "Source", "Airflow")
+_WIDTH = 100                      # report line width
+DEFAULT_OUT_DIR = "./reports"     # used when neither --out-dir nor report_dir is set
+
+
+def _banner(text: str, char: str = "=") -> list[str]:
+    return [char * _WIDTH, f" {text}", char * _WIDTH]
+
+
+def _section_bar(section: str, status: str) -> str:
+    """'--- Loading ------------------------------------------------------- FAIL'"""
+    head = f"--- {section} "
+    return head.ljust(_WIDTH - len(status) - 1, "-") + " " + status
+
+
+def _detail_lines(details: str, indent: int) -> list[str]:
+    pad = " " * indent
+    return textwrap.wrap(details, width=_WIDTH - indent - 2,
+                         initial_indent=f"{pad}> ", subsequent_indent=f"{pad}  ") \
+        if details else []
+
+
+def render_text(reports: list[TableReport], cfg: dict) -> str:
+    overall = worst([r.final_status for r in reports])
+    counts = {s: sum(1 for r in reports if r.final_status == s)
+              for s in (PASS, WARN, FAIL, SKIP)}
+
+    out = _banner("BRONZE LAYER - LOADING TEST REPORT")
+    out += [
+        f" Generated : {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
+        f" Project   : {cfg.get('project_id')}",
+        f" Location  : {cfg.get('location') or '-'}",
+        f" Tables    : {len(reports)}",
+        "",
+        f" FINAL TEST STATUS: {overall}",
+        "=" * _WIDTH,
+        "",
+        "",
+        "SUMMARY",
+        "-" * _WIDTH,
+    ]
+
+    # --- Summary table: one line per table, one column per section ---------- #
+    w_table = max([len("TABLE")] + [len(r.table) for r in reports]) + 2
+    w_load = max([len("LOAD TYPE")] + [len(r.load_type) for r in reports]) + 2
+    w_sec = max(len(s) for s in SECTIONS + (FAIL, WARN, PASS, SKIP)) + 2
+
+    out.append("TABLE".ljust(w_table) + "LOAD TYPE".ljust(w_load) +
+               "".join(s.upper().ljust(w_sec) for s in SECTIONS) + "STATUS")
+    for r in reports:
+        out.append(r.table.ljust(w_table) + r.load_type.ljust(w_load) +
+                   "".join(r.section_status(s).ljust(w_sec) for s in SECTIONS) +
+                   r.final_status)
+    out += ["-" * _WIDTH,
+            " " + "   ".join(f"{s} = {counts[s]}" for s in (PASS, WARN, FAIL, SKIP)),
+            "", ""]
+
+    # --- One block per table ------------------------------------------------ #
+    for i, r in enumerate(reports, 1):
+        title = f"[{i}/{len(reports)}]  {r.table}"
+        out += ["=" * _WIDTH,
+                f" {title}".ljust(_WIDTH - len(r.final_status) - 1) + " " + r.final_status,
+                "=" * _WIDTH]
+        dur = (r.finished_at - r.started_at).total_seconds() if r.finished_at else 0
+        out += [f" load_type = {r.load_type} | duration = {dur:.1f}s",
+                f" compare window = {r.compare_window or '-'}"
+                f" | load window = {r.load_window or '-'}", ""]
+
+        # Column widths adapt to the content so the columns never break apart
+        w_name = max([len("CHECK")] + [len(c.name) for c in r.results]) + 2
+        w_exp = max([len("EXPECTED")] + [len(c.expected or "-") for c in r.results]) + 2
+
+        # Sections in a fixed order, plus anything unexpected (e.g. "Runtime")
+        extra = [s for s in dict.fromkeys(c.section for c in r.results)
+                 if s not in SECTIONS]
+        for section in list(SECTIONS) + extra:
+            checks = [c for c in r.results if c.section == section]
+            if not checks:
+                continue
+            out.append(_section_bar(section, r.section_status(section)))
+            out.append("STATUS".ljust(9) + "CHECK".ljust(w_name) +
+                       "EXPECTED".ljust(w_exp) + "ACTUAL")
+            for c in checks:
+                out.append(c.status.ljust(9) + c.name.ljust(w_name) +
+                           (c.expected or "-").ljust(w_exp) + (c.actual or "-"))
+                out += _detail_lines(c.details, 9)
+            out.append("")
+        out.append("")
+
+    # --- Everything that is not PASS, collected for the ticket -------------- #
+    issues = [(r.table, c) for r in reports for c in r.results
+              if c.status in (WARN, FAIL)]
+    out += _banner("ISSUES TO FOLLOW UP")
+    if issues:
+        w_tbl = max(len(t) for t, _ in issues) + 2
+        w_sct = max(len(c.section) for _, c in issues) + 2
+        for table, c in issues:
+            line = (f" {c.status.ljust(6)}{table.ljust(w_tbl)}{c.section.ljust(w_sct)}"
+                    f"{c.name}: {c.actual or c.details or '-'}")
+            out.append(line[:_WIDTH])
+    else:
+        out.append(" None - all checks passed.")
+    out += ["", f" FINAL TEST STATUS: {overall}", "=" * _WIDTH, ""]
+
+    return "\n".join(out)
+
+
+def write_report(reports: list[TableReport], cfg: dict, out_dir: str,
+                 stamp: str) -> str:
+    path = os.path.join(out_dir, f"bronze_test_{stamp}.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(render_text(reports, cfg))
+    return path
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 
@@ -1004,15 +1130,24 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Bronze loading tests (BigQuery + Oracle)")
     ap.add_argument("--config", required=True, help="Path to YAML config")
     ap.add_argument("--table", action="append", help="Table to test (repeatable)")
+    ap.add_argument("--out-dir", default=None,
+                    help=f"Directory for the report and the log "
+                         f"(default: report_dir from the config, else {DEFAULT_OUT_DIR})")
     ap.add_argument("-v", "--verbose", action="store_true", help="Log the SQL being run")
     args = ap.parse_args(argv)
 
+    cfg = load_config(args.config)
+    out_dir = args.out_dir or cfg.get("report_dir") or DEFAULT_OUT_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(out_dir, f"bronze_test_{stamp}.log")
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)])
+        handlers=[logging.FileHandler(log_path, encoding="utf-8"),
+                  logging.StreamHandler(sys.stdout)])
 
-    cfg = load_config(args.config)
     tables = args.table or [t["name"] for t in cfg.get("tables", [])]
     if not tables:
         LOG.error("No tables to test. Use --table or define tables in the config.")
@@ -1035,12 +1170,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     bq = BQ(cfg["project_id"], cfg.get("location"))
-    statuses = []
+    reports = []
 
     for table in tables:
         tc = table_config(cfg, table)
         rep = TableReport(table=table, load_type=tc.get("load_type", "unknown"),
-                          started_at=datetime.now(timezone.utc))
+                          started_at=datetime.now(timezone.utc),
+                          compare_window=window_label(tc),
+                          load_window=load_window_label(tc))
         LOG.info("=" * 78)
         LOG.info("Testing table: %s (load_type=%s)", table, rep.load_type)
         LOG.info("  compare window: %s on `%s`", window_label(tc),
@@ -1076,13 +1213,17 @@ def main(argv: list[str] | None = None) -> int:
 
         rep.finished_at = datetime.now(timezone.utc)
         LOG.info("FINAL STATUS for %s: %s", table, rep.final_status)
-        statuses.append(rep.final_status)
+        reports.append(rep)
 
     oracle_close()
-    overall = worst(statuses)
+    txt_path = write_report(reports, cfg, out_dir, stamp)
+
+    overall = worst([r.final_status for r in reports])
     LOG.info("-" * 78)
     LOG.info("OVERALL STATUS: %s", overall)
     LOG.info("Bytes billed: %.2f MB", bq.bytes_billed / 1024 / 1024)
+    LOG.info("Report  : %s", txt_path)
+    LOG.info("Log file: %s", log_path)
     return 1 if overall == FAIL else 0
 
 
