@@ -22,10 +22,10 @@ a `source: system: oracle` block those checks report SKIPPED and the BigQuery
 tests run exactly as before. bronze_load_test.py is the version from before
 this integration.
 
-After a successful Oracle login the script asks which source table to test -
-the bare name, no schema, case does not matter (CUSTOMERS = customers =
-SRC_SCHEMA.CUSTOMERS). Enter runs every table from the config; --table skips
-the question altogether.
+After a successful Oracle login the script asks which source tables to test -
+bare names, no schema, case does not matter (CUSTOMERS = customers =
+SRC_SCHEMA.CUSTOMERS), several separated by commas. Enter runs every table from
+the config; --table skips the question altogether.
 
 Timestamps in the report and the log are Polish local time (Europe/Warsaw);
 everything compared against the data itself stays in UTC.
@@ -302,10 +302,10 @@ def source_table_key(name: str) -> str:
 
 
 def pick_tables_by_source(cfg: dict, tables: list[str]) -> list[str] | None:
-    """Ask which source table to test; map the answer back to the bronze table.
+    """Ask which source tables to test; map the answer back to bronze tables.
 
-    Returns None when the whole list should run (nothing to choose from, or the
-    user just pressed Enter).
+    One name or several separated by commas. Returns None when the whole list
+    should run (nothing to choose from, or the user just pressed Enter).
     """
     choices: dict[str, list[str]] = {}
     for t in tables:
@@ -318,18 +318,28 @@ def pick_tables_by_source(cfg: dict, tables: list[str]) -> list[str] | None:
     names = ", ".join(sorted(choices))
     while True:
         try:
-            answer = input(f"\nSource table to test [{names}] (Enter = all): ").strip()
+            answer = input(f"\nSource tables to test, comma separated "
+                           f"[{names}] (Enter = all): ").strip()
         except EOFError:                 # piped stdin - behave like Enter
             return None
         if not answer:
             return None
-        picked = choices.get(source_table_key(answer))
-        if picked:
-            LOG.info("Testing only the table loaded from %s: %s",
-                     answer.upper(), ", ".join(picked))
-            return picked
-        print(f"  No table in the config is loaded from '{answer}'. "
-              f"Known source tables: {names}")
+
+        typed = [part.strip() for part in answer.split(",") if part.strip()]
+        unknown = [part for part in typed if source_table_key(part) not in choices]
+        if unknown:
+            print(f"  No table in the config is loaded from: {', '.join(unknown)}. "
+                  f"Known source tables: {names}")
+            continue
+
+        # One source can feed more than one bronze table, and the same name can
+        # be typed twice - dict.fromkeys keeps the first occurrence of each.
+        picked = list(dict.fromkeys(t for part in typed
+                                    for t in choices[source_table_key(part)]))
+        LOG.info("Testing only the tables loaded from %s: %s",
+                 ", ".join(dict.fromkeys(source_table_key(p) for p in typed)),
+                 ", ".join(picked))
+        return picked
 
 
 def check_row_count(bq: BQ, cfg: dict, tc: dict, rep: TableReport) -> int:
@@ -1246,7 +1256,7 @@ def main(argv: list[str] | None = None) -> int:
                       "and try again.")
             return 2
 
-        # Logged in - now ask which source table to test. Skipped when --table
+        # Logged in - now ask which source tables to test. Skipped when --table
         # already says so, and when there is no terminal to ask at (cron).
         if not args.table and sys.stdin.isatty():
             picked = pick_tables_by_source(cfg, tables)
