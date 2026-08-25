@@ -338,6 +338,18 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
 _DATE_PARAM = re.compile(r"""['"]?[:@]p_date_(from|to)['"]?""", re.IGNORECASE)
 
 
+def strip_terminator(sql: str) -> str:
+    """Drop the trailing ; or / the catalogue text usually carries.
+
+    Those belong to SQL*Plus and the like, not to the statement: sent through
+    the driver they come back as ORA-00933, "SQL command not properly ended".
+    """
+    sql = sql.strip()
+    while sql.endswith((";", "/")):
+        sql = sql[:-1].strip()
+    return sql
+
+
 def valid_date(value: str) -> str:
     """YYYY-MM-DD or nothing. This is what keeps the substitution below safe."""
     return datetime.strptime(str(value).strip(), "%Y-%m-%d").date().isoformat()
@@ -539,8 +551,10 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
                 details=f"the catalogue has no {missing} for this test case")
         return
 
-    sql_oracle, params_oracle = bind_dates(case.sql_oracle, date_from, date_to)
-    sql_gcp, params_gcp = bind_dates(case.sql_gcp, date_from, date_to)
+    sql_oracle, params_oracle = bind_dates(strip_terminator(case.sql_oracle),
+                                           date_from, date_to)
+    sql_gcp, params_gcp = bind_dates(strip_terminator(case.sql_gcp),
+                                     date_from, date_to)
 
     LOG.info("Running test case %s / %s", case.table, case.name)
     oracle = run_oracle(source, sql_oracle, limit)
