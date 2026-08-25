@@ -9,11 +9,11 @@ oracle_meta:
   port: 1521
   service_name: METASVC
   tests_view: V_TEST_DEFINITIONS
-  # columns:                        # only when the view names them differently
-  #   table_name: TABLE_NAME
-  #   test_case: TEST_CASE
-  #   sql_oracle: SQL_ORACLE
-  #   sql_gcp: SQL_GCP
+  columns:                          # as the view names them
+    table_name: TABLE_NAME
+    test_case: TEST_CASE
+    sql_oracle: SQL_ORACLE
+    sql_gcp: SQL_GCP
 
 # Every sql_oracle runs here. ORACLE_USER / ORACLE_PASSWORD, or asked.
 oracle:
@@ -27,7 +27,8 @@ airflow:
   base_url: https://xxxxxxxx.composer.googleusercontent.com
   api_version: v2
   verify_ssl: false                 # corporate network inspects TLS
-  dag_id_prefix: LOAD_              # <dag_id_prefix><dag_prefix><TABLE>
+  dag_id_prefix: LOAD_              # <dag_id_prefix><SCHEMA_><TABLE>
+  dataset_layer_prefixes: [bronze_] # bronze_sys in sql_gcp -> SYS_ in the dag_id
   dag_id_strip_suffixes: [_TMP]
   history_runs: 10
   min_success_ratio_pct: 80

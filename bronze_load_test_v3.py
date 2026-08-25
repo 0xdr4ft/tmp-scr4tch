@@ -132,28 +132,26 @@ class TableReport:
 # Config
 # --------------------------------------------------------------------------- #
 
-DEFAULTS = {
-    "date_from": "2026-06-01",          # start of the default window
-    "max_compare_rows": 50_000,         # bigger result sets are not compared
-    "float_decimals": 6,                # rounding before comparing numbers
-}
-
-# Columns of the catalogue view. Renameable, because only their meaning is
-# fixed - the names differ between installations.
-CATALOGUE_COLUMNS = {
-    "table_name": "TABLE_NAME",
-    "test_case": "TEST_CASE",
-    "sql_oracle": "SQL_ORACLE",
-    "sql_gcp": "SQL_GCP",
-}
+# Everything below lives in the config file - nothing is assumed here. Only
+# the meaning of these keys is fixed; the values, including the names of the
+# catalogue columns, differ between installations.
+REQUIRED_DEFAULTS = ("date_from", "max_compare_rows", "float_decimals")
+CATALOGUE_KEYS = ("table_name", "test_case", "sql_oracle", "sql_gcp")
 
 
 def load_config(path: str) -> dict[str, Any]:
+    """Read the config and refuse to start with pieces missing from it."""
     with open(path, "r", encoding="utf-8") as fh:
-        cfg = yaml.safe_load(fh)
-    merged = dict(DEFAULTS)
-    merged.update(cfg.get("defaults") or {})
-    cfg["defaults"] = merged
+        cfg = yaml.safe_load(fh) or {}
+    cfg["defaults"] = cfg.get("defaults") or {}
+
+    columns = (cfg.get("oracle_meta") or {}).get("columns") or {}
+    missing = [f"defaults.{k}" for k in REQUIRED_DEFAULTS
+               if cfg["defaults"].get(k) is None]
+    missing += [f"oracle_meta.columns.{k}" for k in CATALOGUE_KEYS
+                if not columns.get(k)]
+    if missing:
+        raise ValueError(f"{path} is missing: {', '.join(missing)}")
     return cfg
 
 
@@ -170,9 +168,10 @@ def table_config(cfg: dict, table: str) -> dict:
 
 
 def catalogue_columns(cfg: dict) -> dict[str, str]:
-    cols = dict(CATALOGUE_COLUMNS)
-    cols.update((cfg.get("oracle_meta") or {}).get("columns") or {})
-    return {k: _oracle_ident(str(v), f"catalogue column {k}") for k, v in cols.items()}
+    """The catalogue column names, as the config spells them."""
+    cols = (cfg.get("oracle_meta") or {}).get("columns") or {}
+    return {k: _oracle_ident(str(cols[k]), f"catalogue column {k}")
+            for k in CATALOGUE_KEYS}
 
 
 # --------------------------------------------------------------------------- #
@@ -575,10 +574,44 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
 # 4) Airflow / Cloud Composer  (carried over from v2)
 # --------------------------------------------------------------------------- #
 
+# `project.bronze_sys.table`, project.bronze_sys.table, bronze_sys.table - the
+# dataset is whatever sits one dot before the table name.
+_TABLE_REF = re.compile(
+    r"\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_$-]+(?:`?\s*\.\s*`?[A-Za-z0-9_$-]+)+)`?",
+    re.IGNORECASE)
+
+
+def dataset_of(sql: str) -> str | None:
+    """The BigQuery dataset the query reads from, taken from its first table."""
+    match = _TABLE_REF.search(sql or "")
+    if not match:
+        return None
+    parts = [p for p in match.group(1).replace("`", "").replace(" ", "").split(".") if p]
+    return parts[-2] if len(parts) >= 2 else None
+
+
+def dag_prefix_of(dataset: str, layer_prefixes: Any) -> str:
+    """The source schema part of a dataset name, as the dag_id spells it.
+
+    Datasets carry the layer in front of the schema - bronze_sys - while the
+    dag_id wants the schema alone, so the layer is dropped: bronze_sys -> SYS_.
+    """
+    name = dataset.upper()
+    for prefix in layer_prefixes or []:
+        prefix = str(prefix).upper()
+        if prefix and name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    return f"{name}_" if name else ""
+
+
 def dag_id_for(tc: dict, af: dict) -> str:
     """Build the dag_id from the table name, unless the config states it.
 
         <dag_id_prefix><dag_prefix><TABLE NAME minus a stripped suffix>
+
+    dag_prefix is the source schema; when the config does not give it, it is
+    derived from the dataset in sql_gcp - the only place it appears at all.
     """
     if tc.get("dag_id"):
         return str(tc["dag_id"])
@@ -879,7 +912,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true", help="Log the SQL being run")
     args = ap.parse_args(argv)
 
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except Exception as exc:
+        LOG.error("Config: %s: %s", type(exc).__name__, exc)
+        return 2
     out_dir = args.out_dir or cfg.get("report_dir") or DEFAULT_OUT_DIR
     os.makedirs(out_dir, exist_ok=True)
 
@@ -980,15 +1017,29 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("Testing table: %s", table)
         LOG.info("=" * 78)
 
-        for case in [c for c in cases if c.table.upper() == table.upper()]:
+        table_cases = [c for c in cases if c.table.upper() == table.upper()]
+        for case in table_cases:
             try:
                 run_test_case(bq, source, cfg, case, date_from, date_to, rep)
             except Exception as exc:
                 LOG.exception("Unexpected error in test case %s (%s)", case.name, table)
                 rep.add("Runtime", case.name, FAIL,
                         details=f"{type(exc).__name__}: {exc}")
+
+        # The dag_id carries the source schema, and the only place that name
+        # appears is the dataset in sql_gcp - unless the config states it.
+        tc = table_config(cfg, table)
+        af = cfg.get("airflow") or {}
+        if not tc.get("dag_id") and not tc.get("dag_prefix"):
+            dataset = next((d for d in (dataset_of(c.sql_gcp) for c in table_cases) if d),
+                           None)
+            if dataset:
+                tc["dag_prefix"] = dag_prefix_of(dataset, af.get("dataset_layer_prefixes"))
+                LOG.info("  dag_id from dataset %s: %s", dataset, dag_id_for(tc, af))
+            else:
+                LOG.warning("  no dataset found in sql_gcp - dag_id without the schema")
         try:
-            check_airflow(cfg, table_config(cfg, table), rep)
+            check_airflow(cfg, tc, rep)
         except Exception as exc:
             LOG.exception("Unexpected error in the Airflow check (%s)", table)
             rep.add("Runtime", "Airflow", FAIL, details=f"{type(exc).__name__}: {exc}")
