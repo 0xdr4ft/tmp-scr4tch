@@ -1,0 +1,39 @@
+project_id: my-gcp-project
+location: europe-west4
+report_dir: ./reports
+
+# Catalogue of test cases. ORACLE_META_USER / ORACLE_META_PASSWORD, or asked.
+oracle_meta:
+  label: metadata
+  host: meta-host.example.com
+  port: 1521
+  service_name: METASVC
+  tests_view: V_TEST_DEFINITIONS
+  # columns:                        # only when the view names them differently
+  #   table_name: TABLE_NAME
+  #   test_case: TEST_CASE
+  #   sql_oracle: SQL_ORACLE
+  #   sql_gcp: SQL_GCP
+
+# Every sql_oracle runs here. ORACLE_USER / ORACLE_PASSWORD, or asked.
+oracle:
+  label: source
+  host: oracle-host.example.com
+  port: 1521
+  service_name: ORCLSVC
+
+airflow:
+  enabled: true
+  base_url: https://xxxxxxxx.composer.googleusercontent.com
+  api_version: v2
+  verify_ssl: false                 # corporate network inspects TLS
+  dag_id_prefix: LOAD_              # <dag_id_prefix><dag_prefix><TABLE>
+  dag_id_strip_suffixes: [_TMP]
+  history_runs: 10
+  min_success_ratio_pct: 80
+  duration_factor: 2.0
+
+defaults:
+  date_from: 2026-06-01             # start offered at the prompt; end = yesterday
+  max_compare_rows: 50000           # bigger results are reported, not compared
+  float_decimals: 6                 # rounding before the two sides are compared
