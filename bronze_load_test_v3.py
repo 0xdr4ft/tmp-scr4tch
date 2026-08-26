@@ -483,6 +483,37 @@ class SideResult:
     params: int = 0
 
 
+# A timestamp written as text, in either spelling: 2026-07-01T00:00:00 from
+# BigQuery, 2026-07-01 00:00:00.000 from Oracle, with or without a zone.
+_TS_TEXT = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[T ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?)?"
+    r"\s*(Z|[+-]\d{2}:?\d{2})?$")
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    """A timestamp given as text, or None when the text is not one."""
+    match = _TS_TEXT.match(str(_lob(value)).strip())
+    if not match:
+        return None
+    year, month, day, hour, minute, second, fraction, offset = match.groups()
+    stamp = datetime(int(year), int(month), int(day),
+                     int(hour or 0), int(minute or 0), int(second or 0),
+                     int((fraction or "0").ljust(6, "0")[:6]))
+    if offset and offset != "Z":
+        digits = offset[1:].replace(":", "")
+        away = timedelta(hours=int(digits[:2]), minutes=int(digits[2:] or 0))
+        stamp = stamp - away if offset[0] == "+" else stamp + away
+    return stamp
+
+
+def _format_stamp(stamp: datetime) -> str:
+    """One spelling for both sides. Midnight is a date, as a DATE column is."""
+    if stamp.time() == datetime.min.time():
+        return stamp.date().isoformat()
+    return stamp.isoformat(sep=" ")          # fractions only when they are there
+
+
 def normalise(value: Any, decimals: int) -> Any:
     """One value in a form both databases can agree on.
 
@@ -490,6 +521,10 @@ def normalise(value: Any, decimals: int) -> Any:
     midnight compare as plain dates (Oracle DATE always carries a time, a
     BigQuery DATE never does), and trailing spaces from Oracle CHAR columns are
     dropped.
+
+    Timestamps written as text get the same treatment as the real thing, since
+    the two sides spell them differently - 2026-07-01T00:00:00 against
+    2026-07-01 00:00:00.000 - and that is not a difference in the data.
     """
     value = _lob(value)
     if value is None or isinstance(value, bool):
@@ -509,13 +544,14 @@ def normalise(value: Any, decimals: int) -> Any:
     if isinstance(value, datetime):
         if value.tzinfo is not None:
             value = value.astimezone(timezone.utc).replace(tzinfo=None)
-        return (value.date().isoformat() if value.time() == datetime.min.time()
-                else value.isoformat(sep=" "))
+        return _format_stamp(value)
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, bytes):
         return value.hex()
-    return str(value).rstrip()
+
+    stamp = parse_timestamp(value)
+    return _format_stamp(stamp) if stamp else str(value).rstrip()
 
 
 def normalise_rows(rows: list[tuple], decimals: int) -> list[tuple]:
@@ -536,7 +572,12 @@ def shift_rows(rows: list[tuple], hours: float) -> list[tuple]:
 
     def moved(value: Any) -> Any:
         value = _lob(value)
-        return value + delta if isinstance(value, datetime) else value
+        if isinstance(value, datetime):
+            return value + delta
+        if isinstance(value, date):          # a plain date, deliberately untouched
+            return value
+        stamp = parse_timestamp(value)       # the same thing written as text
+        return stamp + delta if stamp else value
 
     return [tuple(moved(v) for v in row) for row in rows]
 
@@ -549,12 +590,7 @@ def as_datetime(value: Any) -> datetime | None:
                 if value.tzinfo else value)
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
-    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(str(value).strip()[:19], pattern)
-        except (ValueError, TypeError):
-            continue
-    return None
+    return parse_timestamp(value)
 
 
 def drift_hours(left: Any, right: Any) -> float | None:
