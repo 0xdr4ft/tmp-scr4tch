@@ -45,6 +45,7 @@ import itertools
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -311,7 +312,22 @@ def connect_bigquery(cfg: dict) -> BQ | None:
             if answer not in ("y", "yes", "t", "tak"):
                 LOG.error("Log in with: %s", GCLOUD_LOGIN)
                 return None
-            if subprocess.call(GCLOUD_LOGIN.split()) != 0:
+            # Resolved through the PATH on purpose: on Windows the command is
+            # gcloud.cmd, and the bare name is not something the system can
+            # start (WinError 2).
+            command, *arguments = GCLOUD_LOGIN.split()
+            executable = shutil.which(command)
+            if not executable:
+                LOG.error("`%s` is not on the PATH - log in with: %s",
+                          command, GCLOUD_LOGIN)
+                return None
+            try:
+                code = subprocess.call([executable, *arguments])
+            except Exception as exc:
+                LOG.error("Could not start `%s`: %s: %s",
+                          GCLOUD_LOGIN, type(exc).__name__, exc)
+                return None
+            if code != 0:
                 LOG.error("`%s` did not finish - log in and start again", GCLOUD_LOGIN)
                 return None
     return None
