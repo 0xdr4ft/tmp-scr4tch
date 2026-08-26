@@ -119,8 +119,11 @@ class TableReport:
     def add(self, *a, **kw) -> None:
         r = CheckResult(*a, **kw)
         self.results.append(r)
-        LOG.info("[%s] %-38s %-7s %s", r.section, r.name, r.status,
-                 f"actual={r.actual}" if r.actual else r.details)
+        # Both parts, not one or the other: a failure says "not compared" as
+        # its result, and the reason for it lives in the details.
+        told = " ".join(part for part in (f"actual={r.actual}" if r.actual else "",
+                                          r.details) if part)
+        LOG.info("[%s] %-38s %-7s %s", r.section, r.name, r.status, told)
 
     @property
     def final_status(self) -> str:
@@ -171,6 +174,15 @@ def table_config(cfg: dict, table: str) -> dict:
     merged = dict(cfg["defaults"])
     merged["name"] = table
     return merged
+
+
+def tolerance_for(cfg: dict, test_case: str) -> float:
+    """Hours this test case may differ by, from tolerance_hours in the config."""
+    tolerances = cfg.get("tolerance_hours") or {}
+    for name, hours in tolerances.items():
+        if str(name).strip().upper() == test_case.strip().upper():
+            return float(hours)
+    return 0.0
 
 
 def catalogue_columns(cfg: dict) -> dict[str, str]:
@@ -510,6 +522,30 @@ def normalise_rows(rows: list[tuple], decimals: int) -> list[tuple]:
     return [tuple(normalise(v, decimals) for v in row) for row in rows]
 
 
+def as_datetime(value: Any) -> datetime | None:
+    """The value as a naive UTC timestamp, or None when it is not one."""
+    value = _lob(value)
+    if isinstance(value, datetime):
+        return (value.astimezone(timezone.utc).replace(tzinfo=None)
+                if value.tzinfo else value)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(value).strip()[:19], pattern)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def drift_hours(left: Any, right: Any) -> float | None:
+    """How far apart two timestamps are, or None when they are not timestamps."""
+    first, second = as_datetime(left), as_datetime(right)
+    if first is None or second is None:
+        return None
+    return abs((second - first).total_seconds()) / 3600
+
+
 def run_oracle(conn: Any, sql: str, limit: int) -> SideResult:
     try:
         with conn.cursor() as cur:
@@ -563,9 +599,13 @@ def _fmt_rows(names: list[str], rows: list[tuple]) -> list[str]:
     return [_fmt(names, row) for row in rows]
 
 
-def compare_sides(oracle: SideResult, gcp: SideResult,
-                  decimals: int, limit: int) -> tuple[str, str, str]:
-    """(status, actual, details) for one test case."""
+def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
+                  tolerance: float = 0) -> tuple[str, str, str]:
+    """(status, actual, details) for one test case.
+
+    `tolerance` is how many hours two timestamps may differ and still count as
+    equal - the loads do not land on both sides at the same moment.
+    """
     broken = [f"{side} query failed: {res.error}"
               for side, res in (("Oracle", oracle), ("GCP", gcp)) if res.error]
     if broken:
@@ -604,6 +644,21 @@ def compare_sides(oracle: SideResult, gcp: SideResult,
         actual = f"oracle {left} | gcp {right}"
         if left == right:
             return with_note(PASS, actual, "")
+
+        # Timestamps are allowed to drift by the configured tolerance: the two
+        # sides are loaded at different moments, so the newest row is newer on
+        # one of them for a while.
+        if tolerance:
+            drift = drift_hours(oracle.rows[0][0], gcp.rows[0][0])
+            if drift is None:
+                return with_note(FAIL, actual,
+                                 f"values differ and are not timestamps, so the "
+                                 f"{tolerance}h tolerance does not apply")
+            if drift <= tolerance:
+                return with_note(PASS, actual,
+                                 f"{drift:.2f}h apart, within the {tolerance}h tolerance")
+            return with_note(FAIL, actual,
+                             f"{drift:.2f}h apart, more than the {tolerance}h tolerance")
         try:
             diff = Decimal(str(right)) - Decimal(str(left))
             detail = f"difference (gcp - oracle) = {diff:+}"
@@ -651,7 +706,8 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     oracle = run_oracle(source, sql_oracle, limit)
     gcp = run_gcp(bq, sql_gcp, limit)
 
-    status, actual, details = compare_sides(oracle, gcp, decimals, limit)
+    tolerance = tolerance_for(cfg, case.name)
+    status, actual, details = compare_sides(oracle, gcp, decimals, limit, tolerance)
     if not params_oracle or not params_gcp:
         # Worth saying out loud: such a case ignores the window entirely, so its
         # result does not change when the dates do.

@@ -34,6 +34,12 @@ airflow:
   min_success_ratio_pct: 80
   duration_factor: 2.0
 
+# Hours a test case may differ by, per test case. Only for timestamps: the two
+# sides are not loaded at the same moment, so the newest row is newer on one of
+# them for a while. Anything not listed here has to match exactly.
+tolerance_hours:
+  MAX_TIMESTAMP: 2                  # the test case name, as the catalogue spells it
+
 defaults:
   date_from: 2026-06-01             # start offered at the prompt; end = yesterday
   max_compare_rows: 50000           # bigger results are reported, not compared
