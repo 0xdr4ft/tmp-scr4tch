@@ -10,7 +10,8 @@ script runs both, compares the two result sets and reports one check per test
 case. The Airflow / Cloud Composer section is carried over from v2 unchanged.
 
 What the run looks like:
-  1) log in to the metadata database, to the source Oracle, and to BigQuery
+  1) log in to BigQuery first (it is the one that may need a browser), then to
+     the metadata database and the source Oracle
   2) ask which tables to test - one name, or several separated by commas,
      spelled as the catalogue spells them (the BigQuery side is already inside
      sql_gcp, so it never has to be named here)
@@ -44,6 +45,7 @@ import itertools
 import logging
 import os
 import re
+import subprocess
 import sys
 import textwrap
 from collections import Counter
@@ -269,6 +271,50 @@ class BQ:
 
     def check_connection(self) -> None:
         list(self.client.query("SELECT 1", location=self.location).result())
+
+
+GCLOUD_LOGIN = "gcloud auth application-default login"
+
+
+def _needs_login(exc: Exception) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(word in text for word in
+               ("defaultcredentials", "credential", "reauth", "unauthenticated",
+                "could not automatically determine", "invalid_grant"))
+
+
+def connect_bigquery(cfg: dict) -> BQ | None:
+    """Connect to BigQuery, offering the gcloud login when there is none yet.
+
+    On a fresh machine the first run fails on missing application default
+    credentials, and the fix is one command - so it is offered here instead of
+    being left as an error to look up.
+    """
+    for attempt in (1, 2):
+        try:
+            bq = BQ(cfg["project_id"], cfg.get("location"))
+            bq.check_connection()
+            LOG.info("Connected to BigQuery (project %s, location %s)",
+                     cfg["project_id"], cfg.get("location") or "-")
+            return bq
+        except Exception as exc:
+            LOG.error("Cannot reach BigQuery: %s: %s", type(exc).__name__, exc)
+            if not _needs_login(exc):
+                return None                      # not an authentication problem
+            if attempt == 2 or not sys.stdin.isatty():
+                LOG.error("Log in with: %s", GCLOUD_LOGIN)
+                return None
+            try:
+                answer = input(f"\nRun `{GCLOUD_LOGIN}` now? [y/N]: ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in ("y", "yes", "t", "tak"):
+                LOG.error("Log in with: %s", GCLOUD_LOGIN)
+                return None
+            if subprocess.call(GCLOUD_LOGIN.split()) != 0:
+                LOG.error("`%s` did not finish - log in and start again", GCLOUD_LOGIN)
+                return None
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -932,7 +978,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         handlers=handlers)
 
-    # --- Connections first: nothing is worth starting without all three ----- #
+    # --- Connections first: nothing is worth starting without all three. ---- #
+    # BigQuery goes first because it is the one that may need a browser: better
+    # to find that out before typing two database passwords.
+    bq = connect_bigquery(cfg)
+    if bq is None:
+        return 2
+
     connections = []
     for key in ("oracle_meta", "oracle"):
         try:
@@ -943,18 +995,9 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             LOG.error("Cannot connect to `%s`: %s: %s", key, type(exc).__name__, exc)
             LOG.error("No tests were run.")
+            oracle_close_all()
             return 2
     meta, source = connections
-
-    try:
-        bq = BQ(cfg["project_id"], cfg.get("location"))
-        bq.check_connection()
-        LOG.info("Connected to BigQuery (project %s, location %s)",
-                 cfg["project_id"], cfg.get("location") or "-")
-    except Exception as exc:
-        LOG.error("Cannot reach BigQuery: %s: %s", type(exc).__name__, exc)
-        oracle_close_all()
-        return 2
 
     # --- Which tables ------------------------------------------------------- #
     typed: list[str] | None
