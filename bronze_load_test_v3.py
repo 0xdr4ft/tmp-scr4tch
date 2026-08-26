@@ -522,6 +522,25 @@ def normalise_rows(rows: list[tuple], decimals: int) -> list[tuple]:
     return [tuple(normalise(v, decimals) for v in row) for row in rows]
 
 
+def shift_rows(rows: list[tuple], hours: float) -> list[tuple]:
+    """Move every timestamp on one side by a fixed number of hours.
+
+    BigQuery keeps TIMESTAMP in UTC while the source keeps local time, so the
+    two differ by the same amount in every row - a difference of representation,
+    not of data. Plain dates are left alone: shifting one by hours would only
+    move it to the wrong day.
+    """
+    if not hours:
+        return rows
+    delta = timedelta(hours=hours)
+
+    def moved(value: Any) -> Any:
+        value = _lob(value)
+        return value + delta if isinstance(value, datetime) else value
+
+    return [tuple(moved(v) for v in row) for row in rows]
+
+
 def as_datetime(value: Any) -> datetime | None:
     """The value as a naive UTC timestamp, or None when it is not one."""
     value = _lob(value)
@@ -587,11 +606,13 @@ def reorder(rows: list[tuple], names: list[str], target: list[str]) -> list[tupl
 
 
 def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
-                  tolerance: float = 0) -> tuple[str, str, str]:
+                  tolerance: float = 0, shift: float = 0) -> tuple[str, str, str]:
     """(status, actual, details) for one test case.
 
     `tolerance` is how many hours two timestamps may differ and still count as
-    equal - the loads do not land on both sides at the same moment.
+    equal - the loads do not land on both sides at the same moment. `shift`
+    moves every GCP timestamp first, for the constant offset between a column
+    kept in UTC and the same column kept in local time.
     """
     broken = [f"{side} query failed: {res.error}"
               for side, res in (("Oracle", oracle), ("GCP", gcp)) if res.error]
@@ -603,8 +624,12 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
                 f"result larger than max_compare_rows ({limit:,}) - narrow the window "
                 f"or raise the limit; nothing was compared")
 
+    # The shift happens before anything else looks at the values, so the rest
+    # of the comparison - and the tolerance below - sees the two sides in the
+    # same time.
+    gcp_raw = shift_rows(gcp.rows, shift)
     ora_rows = normalise_rows(oracle.rows, decimals)
-    gcp_rows = normalise_rows(gcp.rows, decimals)
+    gcp_rows = normalise_rows(gcp_raw, decimals)
 
     if len(oracle.columns) != len(gcp.columns):
         return (FAIL, f"oracle {len(oracle.columns)} columns | "
@@ -636,7 +661,7 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
         # sides are loaded at different moments, so the newest row is newer on
         # one of them for a while.
         if tolerance:
-            drift = drift_hours(oracle.rows[0][0], gcp.rows[0][0])
+            drift = drift_hours(oracle.rows[0][0], gcp_raw[0][0])
             if drift is None:
                 return with_note(FAIL, actual,
                                  f"values differ and are not timestamps, so the "
@@ -692,7 +717,9 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     gcp = run_gcp(bq, sql_gcp, limit)
 
     tolerance = tolerance_for(cfg, case.name)
-    status, actual, details = compare_sides(oracle, gcp, decimals, limit, tolerance)
+    shift = float(cfg.get("gcp_time_shift_hours") or 0)
+    status, actual, details = compare_sides(oracle, gcp, decimals, limit,
+                                            tolerance, shift)
     if not params_oracle or not params_gcp:
         # Worth saying out loud: such a case ignores the window entirely, so its
         # result does not change when the dates do.
@@ -902,6 +929,10 @@ def render_text(reports: list[TableReport], cfg: dict, window: str) -> str:
         f" Location  : {cfg.get('location') or '-'}",
         f" Window    : {window}",
         f" Tables    : {len(reports)}",
+        # Only when set: it changes what "equal" means, so it belongs on the
+        # front page rather than in a config nobody reads with the report.
+        *([f" GCP times : shifted by {cfg['gcp_time_shift_hours']:+}h before comparing"]
+          if cfg.get("gcp_time_shift_hours") else []),
         "",
         f" FINAL TEST STATUS: {overall}",
         "=" * _WIDTH,
