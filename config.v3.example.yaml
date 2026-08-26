@@ -1,4 +1,4 @@
-project_id: my-gcp-project
+project_id: my-gcp-project          # also fills :p_gcp_project in sql_gcp
 location: europe-west4
 report_dir: ./reports
 

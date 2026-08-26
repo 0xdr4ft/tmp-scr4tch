@@ -25,6 +25,9 @@ text, because in the catalogue they usually sit inside quotes - TO_DATE(':p_date
 _from', 'RRRR-MM-DD') - where a real bind variable would never be seen. Only
 dates that parse as YYYY-MM-DD are ever put there.
 
+The GCP statements name the project the same way, as :p_gcp_project, and that
+one is filled from project_id in the config.
+
 Timestamps in the report and the log are Polish local time (Europe/Warsaw).
 
 Usage:
@@ -350,6 +353,28 @@ def _lob(value: Any) -> Any:
     return value.read() if hasattr(value, "read") else value
 
 
+# The catalogue writes the project as a placeholder, usually inside the table
+# name: `:p_gcp_project.dataset.table`.
+_PROJECT_PARAM = re.compile(r"[:@]p_gcp_project", re.IGNORECASE)
+_PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
+
+
+def bind_project(sql: str, project: str) -> str:
+    """Put project_id where the catalogue left the project placeholder.
+
+    Unlike the dates this is an identifier, not a value, so it goes in bare -
+    quoting it would turn a table name into a string. Any quoting around it
+    belongs to the catalogue and is left alone: `:p_gcp_project.ds.t` keeps its
+    backticks and becomes `project.ds.t`.
+    """
+    if not _PROJECT_PARAM.search(sql or ""):
+        return sql
+    if not _PROJECT_ID.match(str(project or "")):
+        raise ValueError(f"the SQL needs the project, and project_id is "
+                         f"missing or unusable: {project!r}")
+    return _PROJECT_PARAM.sub(str(project), sql)
+
+
 def catalogue_view(cfg: dict) -> str:
     view = (cfg.get("oracle_meta") or {}).get("tests_view")
     if not view:
@@ -379,12 +404,17 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
         cur.execute(sql, binds)
         rows = cur.fetchall()
 
+    # The project goes in right here, so that everything downstream - the
+    # comparison and the dataset the dag_id is built from - sees a real name
+    # rather than a placeholder.
+    project = str(cfg.get("project_id") or "")
     cases = []
     for table, name, sql_oracle, sql_gcp in rows:
         cases.append(TestCase(table=str(_lob(table)).strip(),
                               name=str(_lob(name) or "").strip() or "(unnamed)",
                               sql_oracle=str(_lob(sql_oracle) or "").strip(),
-                              sql_gcp=str(_lob(sql_gcp) or "").strip()))
+                              sql_gcp=bind_project(str(_lob(sql_gcp) or "").strip(),
+                                                   project)))
     return cases
 
 
