@@ -566,11 +566,6 @@ def run_gcp(bq: BQ, sql: str, limit: int) -> SideResult:
         return SideResult(error=f"{type(exc).__name__}: {exc}")
 
 
-def _sample(items: list[str], how_many: int = 3) -> str:
-    shown = "; ".join(items[:how_many])
-    return shown + (f" ... (+{len(items) - how_many} more)" if len(items) > how_many else "")
-
-
 def align_columns(oracle: SideResult, gcp: SideResult) -> list[str] | None:
     """Column names shared by both sides, in the Oracle order, or None.
 
@@ -589,14 +584,6 @@ def align_columns(oracle: SideResult, gcp: SideResult) -> list[str] | None:
 def reorder(rows: list[tuple], names: list[str], target: list[str]) -> list[tuple]:
     order = [names.index(n) for n in target]
     return [tuple(row[i] for i in order) for row in rows]
-
-
-def _fmt(names: list[str], values: tuple) -> str:
-    return ", ".join(f"{n.lower()}={v}" for n, v in zip(names, values))
-
-
-def _fmt_rows(names: list[str], rows: list[tuple]) -> list[str]:
-    return [_fmt(names, row) for row in rows]
 
 
 def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
@@ -676,14 +663,12 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     if not left_n and not right_n:
         return with_note(PASS, rows_seen, "")
 
-    labels = names or [str(c) for c in oracle.columns]
+    # How many differ, and nothing more: a listing of rows says little that the
+    # counts do not, and a wide result buries the rest of the report.
     counted = ", ".join(part for part in (
         f"{left_n:,} only in oracle" if left_n else "",
         f"{right_n:,} only in gcp" if right_n else "") if part)
-    details = [label + _sample(_fmt_rows(labels, list(rows)))
-               for label, rows in (("only in oracle: ", only_oracle),
-                                   ("only in gcp: ", only_gcp)) if rows]
-    return with_note(FAIL, f"{rows_seen}, {counted}", "; ".join(details))
+    return with_note(FAIL, f"{rows_seen}, {counted}", "")
 
 
 def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
