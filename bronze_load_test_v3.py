@@ -43,6 +43,7 @@ Requirements:
 from __future__ import annotations
 
 import argparse
+import csv
 import getpass
 import itertools
 import logging
@@ -475,6 +476,14 @@ def bind_dates(sql: str, date_from: str, date_to: str) -> tuple[str, int]:
 # --------------------------------------------------------------------------- #
 
 @dataclass
+class Diff:
+    """The rows one side has and the other does not, as they were compared."""
+    columns: list[str]
+    only_oracle: list[tuple]
+    only_gcp: list[tuple]
+
+
+@dataclass
 class SideResult:
     columns: list[str] = field(default_factory=list)
     rows: list[tuple] = field(default_factory=list)
@@ -642,8 +651,12 @@ def reorder(rows: list[tuple], names: list[str], target: list[str]) -> list[tupl
 
 
 def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
-                  tolerance: float = 0, shift: float = 0) -> tuple[str, str, str]:
-    """(status, actual, details) for one test case.
+                  tolerance: float = 0,
+                  shift: float = 0) -> tuple[str, str, str, Diff | None]:
+    """(status, actual, details, differing rows) for one test case.
+
+    The differing rows come back only when there are any and the comparison got
+    far enough to know them - a failed query has nothing to show.
 
     `tolerance` is how many hours two timestamps may differ and still count as
     equal - the loads do not land on both sides at the same moment. `shift`
@@ -653,12 +666,12 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     broken = [f"{side} query failed: {res.error}"
               for side, res in (("Oracle", oracle), ("GCP", gcp)) if res.error]
     if broken:
-        return FAIL, "not compared", "; ".join(broken)
+        return FAIL, "not compared", "; ".join(broken), None
 
     if oracle.truncated or gcp.truncated:
         return (WARN, f"oracle {len(oracle.rows):,}+ rows | gcp {len(gcp.rows):,}+ rows",
                 f"result larger than max_compare_rows ({limit:,}) - narrow the window "
-                f"or raise the limit; nothing was compared")
+                f"or raise the limit; nothing was compared", None)
 
     # The shift happens before anything else looks at the values, so the rest
     # of the comparison - and the tolerance below - sees the two sides in the
@@ -671,7 +684,8 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
         return (FAIL, f"oracle {len(oracle.columns)} columns | "
                       f"gcp {len(gcp.columns)} columns",
                 f"the two queries return different shapes: "
-                f"oracle ({', '.join(oracle.columns)}) vs gcp ({', '.join(gcp.columns)})")
+                f"oracle ({', '.join(oracle.columns)}) vs gcp ({', '.join(gcp.columns)})",
+                None)
 
     # Both sides alias their output the same way, so the names decide which
     # column is which; only when they do not line up is position fallen back on.
@@ -683,8 +697,9 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     else:
         gcp_rows = reorder(gcp_rows, [str(c).upper() for c in gcp.columns], names)
 
-    def with_note(status: str, actual: str, details: str) -> tuple[str, str, str]:
-        return status, actual, "; ".join(d for d in (details, note) if d)
+    def with_note(status: str, actual: str, details: str,
+                  diff: Diff | None = None) -> tuple[str, str, str, Diff | None]:
+        return status, actual, "; ".join(d for d in (details, note) if d), diff
 
     # The common case: one number against one number.
     if len(ora_rows) == 1 and len(gcp_rows) == 1 and len(ora_rows[0]) == 1:
@@ -708,8 +723,8 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
             return with_note(FAIL, actual,
                              f"{drift:.2f}h apart, more than the {tolerance}h tolerance")
         try:
-            diff = Decimal(str(right)) - Decimal(str(left))
-            detail = f"difference (gcp - oracle) = {diff:+}"
+            apart = Decimal(str(right)) - Decimal(str(left))
+            detail = f"difference (gcp - oracle) = {apart:+}"
         except (InvalidOperation, TypeError):
             detail = "values differ"
         return with_note(FAIL, actual, detail)
@@ -729,11 +744,55 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     counted = ", ".join(part for part in (
         f"{left_n:,} only in oracle" if left_n else "",
         f"{right_n:,} only in gcp" if right_n else "") if part)
-    return with_note(FAIL, f"{rows_seen}, {counted}", "")
+    labels = names or [str(c) for c in oracle.columns]
+    return with_note(FAIL, f"{rows_seen}, {counted}", "",
+                     Diff(columns=labels,
+                          only_oracle=list(only_oracle.elements()),
+                          only_gcp=list(only_gcp.elements())))
+
+
+def _file_name(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_") or "case"
+
+
+def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
+              sample: int = 10) -> None:
+    """Log the first differing rows and write all of them next to the report.
+
+    The values are the ones actually compared, not the raw ones: that is what
+    makes a difference readable - the same rounding, the same date format, the
+    same shift - and the file opens straight in a spreadsheet.
+    """
+    header = ["side", *(c.lower() for c in diff.columns)]
+    rows = [["oracle", *row] for row in diff.only_oracle]
+    rows += [["gcp", *row] for row in diff.only_gcp]
+    if not rows:
+        return
+
+    widths = [max(len(str(r[i])) for r in [header, *rows[:sample]])
+              for i in range(len(header))]
+    LOG.debug("  %s / %s - first %d of %d differing rows:",
+              case.table, case.name, min(sample, len(rows)), len(rows))
+    for row in [header, *rows[:sample]]:
+        LOG.debug("    " + "  ".join(str(v).ljust(w) for v, w in zip(row, widths)))
+
+    path = os.path.join(out_dir,
+                        f"bronze_test_{stamp}_{_file_name(case.table)}"
+                        f"_{_file_name(case.name)}.csv")
+    try:
+        with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh, delimiter=";")
+            writer.writerow(header)
+            writer.writerows(rows)
+        LOG.debug("  differing rows written to %s", path)
+    except Exception as exc:
+        LOG.warning("  could not write the differences: %s: %s",
+                    type(exc).__name__, exc)
 
 
 def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
-                  date_from: str, date_to: str, rep: TableReport) -> None:
+                  date_from: str, date_to: str, rep: TableReport,
+                  out_dir: str = ".", stamp: str = "") -> None:
     decimals = int(cfg["defaults"]["float_decimals"])
     limit = int(cfg["defaults"]["max_compare_rows"])
 
@@ -754,8 +813,12 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
 
     tolerance = tolerance_for(cfg, case.name)
     shift = float(cfg.get("gcp_time_shift_hours") or 0)
-    status, actual, details = compare_sides(oracle, gcp, decimals, limit,
-                                            tolerance, shift)
+    status, actual, details, diff = compare_sides(oracle, gcp, decimals, limit,
+                                                  tolerance, shift)
+    # Only with -v: the rows themselves, for reading side by side in a
+    # spreadsheet rather than squinting at a report.
+    if diff and LOG.isEnabledFor(logging.DEBUG):
+        show_diff(case, diff, out_dir, stamp)
     if not params_oracle or not params_gcp:
         # Worth saying out loud: such a case ignores the window entirely, so its
         # result does not change when the dates do.
@@ -1217,7 +1280,8 @@ def main(argv: list[str] | None = None) -> int:
         table_cases = [c for c in cases if c.table.upper() == table.upper()]
         for case in table_cases:
             try:
-                run_test_case(bq, source, cfg, case, date_from, date_to, rep)
+                run_test_case(bq, source, cfg, case, date_from, date_to, rep,
+                              out_dir, stamp)
             except Exception as exc:
                 LOG.exception("Unexpected error in test case %s (%s)", case.name, table)
                 rep.add("Runtime", case.name, FAIL,
