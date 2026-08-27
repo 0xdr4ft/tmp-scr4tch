@@ -92,6 +92,45 @@ PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIPPED"
 _SEVERITY = {SKIP: 0, PASS: 1, WARN: 2, FAIL: 3}
 
 
+_COLOURS = {PASS: "\033[32m", WARN: "\033[33m", FAIL: "\033[31m", SKIP: "\033[90m"}
+_RESET = "\033[0m"
+_STATUS_WORD = re.compile(rf"\b({'|'.join(_COLOURS)})\b")
+
+
+class ColourFormatter(logging.Formatter):
+    """Colours the status words on the console. The log file stays plain."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        return _STATUS_WORD.sub(
+            lambda m: f"{_COLOURS[m.group(1)]}{m.group(1)}{_RESET}", text)
+
+
+def colour_works(stream: Any) -> bool:
+    """Whether this console can show colours - and wants to.
+
+    Redirected output gets none, so escape codes never end up in a file, and
+    NO_COLOR is honoured. Windows consoles need the sequences switched on
+    before they render rather than print as gibberish.
+    """
+    if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", None):
+        return False
+    if not stream.isatty():
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)          # stdout
+            mode = ctypes.c_ulong()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)   # VT processing
+        except Exception:
+            return False
+    return True
+
+
 def worst(statuses: list[str]) -> str:
     """Aggregate a list of statuses into the most severe one."""
     if not statuses:
@@ -1197,13 +1236,21 @@ def main(argv: list[str] | None = None) -> int:
 
     stamp = now_local().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(out_dir, f"bronze_test_{stamp}.log")
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s")
-    if LOCAL_TZ:
-        fmt.converter = lambda secs: datetime.fromtimestamp(secs, LOCAL_TZ).timetuple()
-    handlers = [logging.FileHandler(log_path, encoding="utf-8"),
-                logging.StreamHandler(sys.stdout)]
+    layout = "%(asctime)s %(levelname)-7s %(message)s"
+    clock = (lambda secs: datetime.fromtimestamp(secs, LOCAL_TZ).timetuple()) \
+        if LOCAL_TZ else None
+
+    to_file = logging.FileHandler(log_path, encoding="utf-8")
+    to_screen = logging.StreamHandler(sys.stdout)
+    # The console may be coloured; what lands in the file must not be, or the
+    # log fills up with escape codes.
+    to_file.setFormatter(logging.Formatter(layout))
+    to_screen.setFormatter((ColourFormatter if colour_works(sys.stdout)
+                            else logging.Formatter)(layout))
+    handlers = [to_file, to_screen]
     for handler in handlers:
-        handler.setFormatter(fmt)
+        if clock:
+            handler.formatter.converter = clock
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         handlers=handlers)
 
