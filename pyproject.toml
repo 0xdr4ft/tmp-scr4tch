@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loading-tests"
+version = "3.0.0"
+requires-python = ">=3.10"
+dependencies = [
+    "google-cloud-bigquery",
+    "pyyaml",
+    "oracledb",
+]
+
+[project.scripts]
+# The name you type in the terminal. Rename it to whatever suits, then run
+#   pip install -e .
+# again - the command is created at install time, not read at every run.
+loading-tests = "bronze_load_test_v3:main"
+
+[tool.setuptools]
+py-modules = ["bronze_load_test_v3"]

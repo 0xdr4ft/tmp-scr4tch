@@ -36,6 +36,11 @@ Usage:
     python bronze_load_test_v3.py --config config.yaml --table CUSTOMERS \\
         --date-from 2026-06-01 --date-to 2026-08-24
 
+As a command of its own, typed anywhere:
+    pip install -e .            # name it in pyproject.toml, [project.scripts]
+    loading-tests               # config.yaml from the current directory,
+                                # or wherever LOADING_TESTS_CONFIG points
+
 Requirements:
     pip install google-cloud-bigquery pyyaml oracledb
 """
@@ -1214,7 +1219,12 @@ def ask_window(cfg: dict) -> tuple[str, str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Loading tests from the metadata catalogue (Oracle + BigQuery)")
-    ap.add_argument("--config", required=True, help="Path to YAML config")
+    # Not required, so the installed command can be typed on its own: it picks
+    # up config.yaml from the current directory unless told otherwise.
+    ap.add_argument("--config",
+                    default=os.environ.get("LOADING_TESTS_CONFIG", "config.yaml"),
+                    help="Path to YAML config (default: LOADING_TESTS_CONFIG "
+                         "from the environment, else config.yaml here)")
     ap.add_argument("--table", action="append",
                     help="Table to test (repeatable, or comma separated); "
                          "skips the question")
