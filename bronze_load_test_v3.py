@@ -755,39 +755,46 @@ def _file_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_") or "case"
 
 
+def _sort_key(row: tuple) -> tuple:
+    """Order rows the same way on both sides; None sorts as the empty string."""
+    return tuple("" if v is None else str(v) for v in row)
+
+
 def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
               sample: int = 10) -> None:
-    """Log the first differing rows and write all of them next to the report.
+    """Log the first differing rows and write one file per side.
 
-    The values are the ones actually compared, not the raw ones: that is what
-    makes a difference readable - the same rounding, the same date format, the
-    same shift - and the file opens straight in a spreadsheet.
+    Two files rather than one, sorted the same way, so that opening them side
+    by side in an editor shows the differences and nothing else. The values are
+    the ones actually compared, not the raw ones: the same rounding, the same
+    date format, the same shift.
     """
-    header = ["side", *(c.lower() for c in diff.columns)]
-    rows = [["oracle", *row] for row in diff.only_oracle]
-    rows += [["gcp", *row] for row in diff.only_gcp]
-    if not rows:
+    header = [c.lower() for c in diff.columns]
+    sides = {"oracle": sorted(diff.only_oracle, key=_sort_key),
+             "gcp": sorted(diff.only_gcp, key=_sort_key)}
+    if not any(sides.values()):
         return
 
-    widths = [max(len(str(r[i])) for r in [header, *rows[:sample]])
-              for i in range(len(header))]
-    LOG.debug("  %s / %s - first %d of %d differing rows:",
-              case.table, case.name, min(sample, len(rows)), len(rows))
-    for row in [header, *rows[:sample]]:
+    shown = [["side", *header]]
+    shown += [[side, *row] for side, rows in sides.items() for row in rows[:sample]]
+    widths = [max(len(str(r[i])) for r in shown) for i in range(len(shown[0]))]
+    LOG.debug("  %s / %s - differing rows: %d oracle, %d gcp",
+              case.table, case.name, len(sides["oracle"]), len(sides["gcp"]))
+    for row in shown:
         LOG.debug("    " + "  ".join(str(v).ljust(w) for v, w in zip(row, widths)))
 
-    path = os.path.join(out_dir,
-                        f"bronze_test_{stamp}_{_file_name(case.table)}"
-                        f"_{_file_name(case.name)}.csv")
-    try:
-        with open(path, "w", encoding="utf-8-sig", newline="") as fh:
-            writer = csv.writer(fh, delimiter=";")
-            writer.writerow(header)
-            writer.writerows(rows)
-        LOG.debug("  differing rows written to %s", path)
-    except Exception as exc:
-        LOG.warning("  could not write the differences: %s: %s",
-                    type(exc).__name__, exc)
+    base = f"bronze_test_{stamp}_{_file_name(case.table)}_{_file_name(case.name)}"
+    for side, rows in sides.items():
+        path = os.path.join(out_dir, f"{base}_{side}.csv")
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+                writer = csv.writer(fh, delimiter=";")
+                writer.writerow(header)
+                writer.writerows(rows)
+            LOG.debug("  %-6s -> %s", side, path)
+        except Exception as exc:
+            LOG.warning("  could not write the %s rows: %s: %s",
+                        side, type(exc).__name__, exc)
 
 
 def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
@@ -1089,10 +1096,15 @@ def render_text(reports: list[TableReport], cfg: dict, window: str) -> str:
     if issues:
         w_tbl = max(len(t) for t, _ in issues) + 2
         w_sct = max(len(c.section) for _, c in issues) + 2
+        # Wrapped, not cut: this is the part of the report that gets pasted
+        # into a ticket, and half a sentence there helps nobody. The follow-on
+        # lines are indented to under the check name, but never so far that
+        # there is no room left to write in.
+        indent = " " * min(1 + 6 + w_tbl + w_sct, _WIDTH // 3)
         for table, c in issues:
             line = (f" {c.status.ljust(6)}{table.ljust(w_tbl)}{c.section.ljust(w_sct)}"
                     f"{c.name}: {c.actual or c.details or '-'}")
-            out.append(line[:_WIDTH])
+            out += textwrap.wrap(line, width=_WIDTH, subsequent_indent=indent) or [line]
     else:
         out.append(" None - all checks passed.")
     out += ["", f" FINAL TEST STATUS: {overall}", "=" * _WIDTH, ""]
