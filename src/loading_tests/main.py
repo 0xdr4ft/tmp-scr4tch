@@ -201,6 +201,25 @@ def load_config(path: str) -> dict[str, Any]:
     return cfg
 
 
+def find_config(given: str | None) -> str:
+    """The config file: what was asked for, or the first place it turns up.
+
+    The last place looked at is the project directory the package was installed
+    from, so the command works from anywhere without carrying a path around.
+    """
+    if given:
+        return given
+    if os.environ.get("LOADING_TESTS_CONFIG"):
+        return os.environ["LOADING_TESTS_CONFIG"]
+
+    here = os.path.join(os.getcwd(), "config.yaml")
+    project = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for path in (here, os.path.join(project, "config.yaml")):
+        if os.path.isfile(path):
+            return path
+    return here                          # so the error names the obvious place
+
+
 def table_config(cfg: dict, table: str) -> dict:
     """Per-table settings (Airflow naming), matched without regard to case."""
     for t in cfg.get("tables", []):
@@ -1149,9 +1168,9 @@ def main(argv: list[str] | None = None) -> int:
         description="Loading tests from the metadata catalogue (Oracle + BigQuery)")
     # Not required, so the installed command can be typed on its own.
     ap.add_argument("--config",
-                    default=os.environ.get("LOADING_TESTS_CONFIG", "config.yaml"),
-                    help="Path to YAML config (default: LOADING_TESTS_CONFIG "
-                         "from the environment, else config.yaml here)")
+                    help="Path to YAML config. Without it: LOADING_TESTS_CONFIG, "
+                         "then config.yaml here, then the one next to the "
+                         "installed project")
     ap.add_argument("--table", action="append",
                     help="Table to test (repeatable, or comma separated); "
                          "skips the question")
@@ -1164,11 +1183,19 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        cfg = load_config(args.config)
+        config_path = find_config(args.config)
+        cfg = load_config(config_path)
     except Exception as exc:
         LOG.error("Config: %s: %s", type(exc).__name__, exc)
         return 2
+
+    # A relative report_dir belongs to the config, not to wherever the command
+    # was typed - otherwise reports scatter across the disk. --out-dir is the
+    # user speaking, so it is left as given.
     out_dir = args.out_dir or cfg.get("report_dir") or DEFAULT_OUT_DIR
+    if not args.out_dir and not os.path.isabs(out_dir):
+        out_dir = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(config_path)), out_dir))
     os.makedirs(out_dir, exist_ok=True)
 
     stamp = now_local().strftime("%Y%m%d_%H%M%S")
@@ -1189,6 +1216,7 @@ def main(argv: list[str] | None = None) -> int:
             handler.formatter.converter = clock
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         handlers=handlers)
+    LOG.info("Config: %s", os.path.abspath(config_path))
 
     # --- Connections first, BigQuery ahead of the rest: it is the one that
     # may open a browser, and better to learn that before typing passwords. -- #
