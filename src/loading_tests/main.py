@@ -212,12 +212,15 @@ def find_config(given: str | None) -> str:
     if os.environ.get("LOADING_TESTS_CONFIG"):
         return os.environ["LOADING_TESTS_CONFIG"]
 
-    here = os.path.join(os.getcwd(), "config.yaml")
     project = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    for path in (here, os.path.join(project, "config.yaml")):
+    looked = [os.path.join(os.getcwd(), "config.yaml"),
+              os.path.join(project, "config.yaml")]
+    for path in looked:
         if os.path.isfile(path):
             return path
-    return here                          # so the error names the obvious place
+    raise FileNotFoundError(
+        "no config.yaml. Looked in:\n  " + "\n  ".join(looked)
+        + "\nPass --config, or set LOADING_TESTS_CONFIG")
 
 
 def table_config(cfg: dict, table: str) -> dict:
