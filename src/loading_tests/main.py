@@ -2,12 +2,11 @@
 """
 Loading tests driven by the test catalogue kept in the metadata database.
 
-v2 asked its own questions about the data - row counts, NULL ratios, duplicates.
-v3 asks none of them: every test case comes from a view in the metadata
-database, which for each table lists test cases, and for each test case the SQL
-to run on the source Oracle and the equivalent SQL to run on BigQuery. The
-script runs both, compares the two result sets and reports one check per test
-case. The Airflow / Cloud Composer section is carried over from v2 unchanged.
+Every test case comes from a view there: for each table it lists the cases, and
+for each case the SQL to run on the source Oracle and the equivalent SQL to run
+on BigQuery. This runs both, compares the two result sets and reports one check
+per test case, then looks at the table's Airflow DAG. Adding a test case means
+adding a row to that view.
 
 What the run looks like:
   1) log in to BigQuery first (it is the one that may need a browser), then to
@@ -31,18 +30,14 @@ one is filled from project_id in the config.
 Timestamps in the report and the log are Polish local time (Europe/Warsaw).
 
 Usage:
-    python bronze_load_test_v3.py --config config.yaml
-    python bronze_load_test_v3.py --config config.yaml --table CUSTOMERS,ORDERS
-    python bronze_load_test_v3.py --config config.yaml --table CUSTOMERS \\
-        --date-from 2026-06-01 --date-to 2026-08-24
-
-As a command of its own, typed anywhere:
-    pip install -e .            # name it in pyproject.toml, [project.scripts]
+    uv pip install -e .         # name the command in pyproject.toml
     loading-tests               # config.yaml from the current directory,
                                 # or wherever LOADING_TESTS_CONFIG points
+    loading-tests --table CUSTOMERS,ORDERS
+    loading-tests --table CUSTOMERS --date-from 2026-06-01 --date-to 2026-08-24
 
-Requirements:
-    pip install google-cloud-bigquery pyyaml oracledb
+Without installing:
+    uv run python -m loading_tests --config config.yaml
 """
 
 from __future__ import annotations
@@ -71,7 +66,7 @@ try:
 except ImportError:  # pragma: no cover
     bigquery = None
 
-LOG = logging.getLogger("bronze_load_test")
+LOG = logging.getLogger("loading_tests")
 
 # --------------------------------------------------------------------------- #
 # Local time
