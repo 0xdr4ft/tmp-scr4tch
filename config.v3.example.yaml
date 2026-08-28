@@ -34,12 +34,6 @@ airflow:
   min_success_ratio_pct: 80
   duration_factor: 2.0
 
-# Every GCP timestamp is moved by this many hours before the two sides are
-# compared. BigQuery keeps TIMESTAMP in UTC while the source keeps local time,
-# and that is a constant difference of representation, not of data. Leave at 0
-# when both sides already agree, or fix it in sql_gcp instead.
-gcp_time_shift_hours: 0
-
 # Hours a test case may differ by, per test case. Only for timestamps: the two
 # sides are not loaded at the same moment, so the newest row is newer on one of
 # them for a while. Anything not listed here has to match exactly.
@@ -50,3 +44,5 @@ defaults:
   date_from: 2026-06-01             # start offered at the prompt; end = yesterday
   max_compare_rows: 50000           # bigger results are reported, not compared
   float_decimals: 6                 # rounding before the two sides are compared
+  timestamp_decimals: 3             # digits of a second kept: Oracle keeps 6,
+                                    # BigQuery 3, and the rest is storage noise

@@ -112,11 +112,10 @@ class ColourFormatter(logging.Formatter):
 
 
 def colour_works(stream: Any) -> bool:
-    """Whether this console can show colours - and wants to.
+    """Whether this console shows colours - and wants to.
 
-    Redirected output gets none, so escape codes never end up in a file, and
-    NO_COLOR is honoured. Windows consoles need the sequences switched on
-    before they render rather than print as gibberish.
+    Redirected output gets none, NO_COLOR is honoured, and Windows needs the
+    sequences switched on first or they print as gibberish.
     """
     if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", None):
         return False
@@ -164,8 +163,7 @@ class TableReport:
     def add(self, *a, **kw) -> None:
         r = CheckResult(*a, **kw)
         self.results.append(r)
-        # Both parts, not one or the other: a failure says "not compared" as
-        # its result, and the reason for it lives in the details.
+        # A failure says "not compared" and puts the reason in the details.
         told = " ".join(part for part in (f"actual={r.actual}" if r.actual else "",
                                           r.details) if part)
         LOG.info("[%s] %-38s %-7s %s", r.section, r.name, r.status, told)
@@ -186,10 +184,9 @@ class TableReport:
 # Config
 # --------------------------------------------------------------------------- #
 
-# Everything below lives in the config file - nothing is assumed here. Only
-# the meaning of these keys is fixed; the values, including the names of the
-# catalogue columns, differ between installations.
-REQUIRED_DEFAULTS = ("date_from", "max_compare_rows", "float_decimals")
+# Only the keys are fixed here; every value lives in the config file.
+REQUIRED_DEFAULTS = ("date_from", "max_compare_rows", "float_decimals",
+                     "timestamp_decimals")
 CATALOGUE_KEYS = ("table_name", "test_case", "sql_oracle", "sql_gcp")
 
 
@@ -347,9 +344,8 @@ def _needs_login(exc: Exception) -> bool:
 def connect_bigquery(cfg: dict) -> BQ | None:
     """Connect to BigQuery, offering the gcloud login when there is none yet.
 
-    On a fresh machine the first run fails on missing application default
-    credentials, and the fix is one command - so it is offered here instead of
-    being left as an error to look up.
+    The first run on a new machine fails on missing credentials, and the fix
+    is one command - so it is offered rather than left to look up.
     """
     for attempt in (1, 2):
         try:
@@ -372,9 +368,7 @@ def connect_bigquery(cfg: dict) -> BQ | None:
             if answer not in ("y", "yes", "t", "tak"):
                 LOG.error("Log in with: %s", GCLOUD_LOGIN)
                 return None
-            # Resolved through the PATH on purpose: on Windows the command is
-            # gcloud.cmd, and the bare name is not something the system can
-            # start (WinError 2).
+            # On Windows it is gcloud.cmd; the bare name gives WinError 2.
             command, *arguments = GCLOUD_LOGIN.split()
             executable = shutil.which(command)
             if not executable:
@@ -410,8 +404,7 @@ def _lob(value: Any) -> Any:
     return value.read() if hasattr(value, "read") else value
 
 
-# The catalogue writes the project as a placeholder, usually inside the table
-# name: `:p_gcp_project.dataset.table`.
+# Usually inside the table name: `:p_gcp_project.dataset.table`.
 _PROJECT_PARAM = re.compile(r"[:@]p_gcp_project", re.IGNORECASE)
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
@@ -419,10 +412,8 @@ _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 def bind_project(sql: str, project: str) -> str:
     """Put project_id where the catalogue left the project placeholder.
 
-    Unlike the dates this is an identifier, not a value, so it goes in bare -
-    quoting it would turn a table name into a string. Any quoting around it
-    belongs to the catalogue and is left alone: `:p_gcp_project.ds.t` keeps its
-    backticks and becomes `project.ds.t`.
+    An identifier, not a value: it goes in bare, and whatever quoting the
+    catalogue has around it stays - `:p_gcp_project.ds.t` becomes `project.ds.t`.
     """
     if not _PROJECT_PARAM.search(sql or ""):
         return sql
@@ -442,9 +433,8 @@ def catalogue_view(cfg: dict) -> str:
 def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
     """Test cases of the given tables, matched without regard to case.
 
-    Only the name the catalogue itself stores is asked for - the BigQuery side
-    is already spelled out inside sql_gcp, so nothing here needs to know how it
-    differs.
+    Only the catalogue's own name is asked for; the BigQuery one is already
+    inside sql_gcp.
     """
     col = catalogue_columns(cfg)
     binds = {f"t{i}": t.strip().upper()
@@ -461,9 +451,7 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
         cur.execute(sql, binds)
         rows = cur.fetchall()
 
-    # The project goes in right here, so that everything downstream - the
-    # comparison and the dataset the dag_id is built from - sees a real name
-    # rather than a placeholder.
+    # In here, so the dag_id and the comparison see a real name later on.
     project = str(cfg.get("project_id") or "")
     cases = []
     for table, name, sql_oracle, sql_gcp in rows:
@@ -479,18 +467,16 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
 # 2) Date parameters
 # --------------------------------------------------------------------------- #
 
-# ':p_date_from', ":p_date_from", @p_date_from or a bare :p_date_from - the
-# quotes belong to the stored SQL, so they are swallowed and put back. Spaces
-# around the parameter are left alone, or `>= :p_date_from AND` would come out
-# glued together.
+# ':p_date_from', ":p_date_from", @p_date_from or bare. Quotes are swallowed
+# and put back; spaces are not, or `>= :p_date_from AND` comes out glued.
 _DATE_PARAM = re.compile(r"""['"]?[:@]p_date_(from|to)['"]?""", re.IGNORECASE)
 
 
 def strip_terminator(sql: str) -> str:
     """Drop the trailing ; or / the catalogue text usually carries.
 
-    Those belong to SQL*Plus and the like, not to the statement: sent through
-    the driver they come back as ORA-00933, "SQL command not properly ended".
+    They belong to SQL*Plus, not to the statement - the driver answers them
+    with ORA-00933.
     """
     sql = sql.strip()
     while sql.endswith((";", "/")):
@@ -536,8 +522,7 @@ class SideResult:
     params: int = 0
 
 
-# A timestamp written as text, in either spelling: 2026-07-01T00:00:00 from
-# BigQuery, 2026-07-01 00:00:00.000 from Oracle, with or without a zone.
+# Either spelling: 2026-07-01T00:00:00 or 2026-07-01 00:00:00.000, zone or not.
 _TS_TEXT = re.compile(
     r"^(\d{4})-(\d{2})-(\d{2})"
     r"(?:[T ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?)?"
@@ -560,24 +545,26 @@ def parse_timestamp(value: Any) -> datetime | None:
     return stamp
 
 
-def _format_stamp(stamp: datetime) -> str:
-    """One spelling for both sides. Midnight is a date, as a DATE column is."""
+def _format_stamp(stamp: datetime, decimals: int = 6) -> str:
+    """One spelling for both sides. Midnight is a date, as a DATE column is.
+
+    The fraction of a second is cut to `decimals` digits: Oracle TIMESTAMP(6)
+    holds .187416 where BigQuery holds .187000, which is storage, not data.
+    """
+    if decimals < 6:
+        step = 10 ** (6 - decimals)
+        stamp = stamp.replace(microsecond=stamp.microsecond // step * step)
     if stamp.time() == datetime.min.time():
         return stamp.date().isoformat()
     return stamp.isoformat(sep=" ")          # fractions only when they are there
 
 
-def normalise(value: Any, decimals: int) -> Any:
+def normalise(value: Any, decimals: int, stamp_decimals: int = 6) -> Any:
     """One value in a form both databases can agree on.
 
-    Numbers are rounded to the configured number of decimals, timestamps at
-    midnight compare as plain dates (Oracle DATE always carries a time, a
-    BigQuery DATE never does), and trailing spaces from Oracle CHAR columns are
-    dropped.
-
-    Timestamps written as text get the same treatment as the real thing, since
-    the two sides spell them differently - 2026-07-01T00:00:00 against
-    2026-07-01 00:00:00.000 - and that is not a difference in the data.
+    Numbers rounded, trailing spaces from CHAR columns dropped, midnight
+    compared as a plain date. Timestamps written as text are treated as
+    timestamps - the two sides spell them differently.
     """
     value = _lob(value)
     if value is None or isinstance(value, bool):
@@ -590,49 +577,26 @@ def normalise(value: Any, decimals: int) -> Any:
         try:
             number = number.quantize(Decimal(1).scaleb(-decimals))
         except InvalidOperation:
-            # More digits than the decimal context allows - a sum that large is
-            # compared as it came out of the database.
+            # More digits than the context allows; compare it as it came.
             pass
         return format(number.normalize(), "f")
     if isinstance(value, datetime):
         if value.tzinfo is not None:
             value = value.astimezone(timezone.utc).replace(tzinfo=None)
-        return _format_stamp(value)
+        return _format_stamp(value, stamp_decimals)
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, bytes):
         return value.hex()
 
     stamp = parse_timestamp(value)
-    return _format_stamp(stamp) if stamp else str(value).rstrip()
+    return _format_stamp(stamp, stamp_decimals) if stamp else str(value).rstrip()
 
 
-def normalise_rows(rows: list[tuple], decimals: int) -> list[tuple]:
-    return [tuple(normalise(v, decimals) for v in row) for row in rows]
-
-
-def shift_rows(rows: list[tuple], hours: float) -> list[tuple]:
-    """Move every timestamp on one side by a fixed number of hours.
-
-    BigQuery keeps TIMESTAMP in UTC while the source keeps local time, so the
-    two differ by the same amount in every row - a difference of representation,
-    not of data. Plain dates are left alone: shifting one by hours would only
-    move it to the wrong day.
-    """
-    if not hours:
-        return rows
-    delta = timedelta(hours=hours)
-
-    def moved(value: Any) -> Any:
-        value = _lob(value)
-        if isinstance(value, datetime):
-            return value + delta
-        if isinstance(value, date):          # a plain date, deliberately untouched
-            return value
-        stamp = parse_timestamp(value)       # the same thing written as text
-        return stamp + delta if stamp else value
-
-    return [tuple(moved(v) for v in row) for row in rows]
+def normalise_rows(rows: list[tuple], decimals: int,
+                   stamp_decimals: int = 6) -> list[tuple]:
+    return [tuple(normalise(v, decimals, stamp_decimals) for v in row)
+            for row in rows]
 
 
 def as_datetime(value: Any) -> datetime | None:
@@ -677,10 +641,7 @@ def run_gcp(bq: BQ, sql: str, limit: int) -> SideResult:
 def align_columns(oracle: SideResult, gcp: SideResult) -> list[str] | None:
     """Column names shared by both sides, in the Oracle order, or None.
 
-    Every test case in the catalogue gives its output the same aliases on both
-    sides, so the names - not the position - say which column matches which.
-    None means they cannot be trusted here: different names, or a name used
-    twice.
+    None when the names cannot be trusted: they differ, or one is used twice.
     """
     left = [str(c).upper() for c in oracle.columns]
     right = [str(c).upper() for c in gcp.columns]
@@ -696,16 +657,11 @@ def reorder(rows: list[tuple], names: list[str], target: list[str]) -> list[tupl
 
 def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
                   tolerance: float = 0,
-                  shift: float = 0) -> tuple[str, str, str, Diff | None]:
+                  stamp_decimals: int = 6) -> tuple[str, str, str, Diff | None]:
     """(status, actual, details, differing rows) for one test case.
 
-    The differing rows come back only when there are any and the comparison got
-    far enough to know them - a failed query has nothing to show.
-
-    `tolerance` is how many hours two timestamps may differ and still count as
-    equal - the loads do not land on both sides at the same moment. `shift`
-    moves every GCP timestamp first, for the constant offset between a column
-    kept in UTC and the same column kept in local time.
+    The rows come back only when there are any to show. `tolerance` is how
+    many hours two timestamps may differ and still count as equal.
     """
     broken = [f"{side} query failed: {res.error}"
               for side, res in (("Oracle", oracle), ("GCP", gcp)) if res.error]
@@ -717,12 +673,8 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
                 f"result larger than max_compare_rows ({limit:,}) - narrow the window "
                 f"or raise the limit; nothing was compared", None)
 
-    # The shift happens before anything else looks at the values, so the rest
-    # of the comparison - and the tolerance below - sees the two sides in the
-    # same time.
-    gcp_raw = shift_rows(gcp.rows, shift)
-    ora_rows = normalise_rows(oracle.rows, decimals)
-    gcp_rows = normalise_rows(gcp_raw, decimals)
+    ora_rows = normalise_rows(oracle.rows, decimals, stamp_decimals)
+    gcp_rows = normalise_rows(gcp.rows, decimals, stamp_decimals)
 
     if len(oracle.columns) != len(gcp.columns):
         return (FAIL, f"oracle {len(oracle.columns)} columns | "
@@ -731,8 +683,7 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
                 f"oracle ({', '.join(oracle.columns)}) vs gcp ({', '.join(gcp.columns)})",
                 None)
 
-    # Both sides alias their output the same way, so the names decide which
-    # column is which; only when they do not line up is position fallen back on.
+    # Both sides use the same aliases, so names decide which column is which.
     names = align_columns(oracle, gcp)
     note = ""
     if names is None:
@@ -752,11 +703,9 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
         if left == right:
             return with_note(PASS, actual, "")
 
-        # Timestamps are allowed to drift by the configured tolerance: the two
-        # sides are loaded at different moments, so the newest row is newer on
-        # one of them for a while.
+        # The two sides load at different moments, hence the tolerance.
         if tolerance:
-            drift = drift_hours(oracle.rows[0][0], gcp_raw[0][0])
+            drift = drift_hours(oracle.rows[0][0], gcp.rows[0][0])
             if drift is None:
                 return with_note(FAIL, actual,
                                  f"values differ and are not timestamps, so the "
@@ -773,9 +722,7 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
             detail = "values differ"
         return with_note(FAIL, actual, detail)
 
-    # Whole rows, however many columns they have: a row belongs to the result
-    # or it does not. Counter also catches a row that appears a different
-    # number of times on the two sides.
+    # Whole rows, any width. Counter also catches differing row counts.
     rows_seen = f"oracle {len(ora_rows):,} rows | gcp {len(gcp_rows):,} rows"
     only_oracle = Counter(ora_rows) - Counter(gcp_rows)
     only_gcp = Counter(gcp_rows) - Counter(ora_rows)
@@ -783,8 +730,7 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     if not left_n and not right_n:
         return with_note(PASS, rows_seen, "")
 
-    # How many differ, and nothing more: a listing of rows says little that the
-    # counts do not, and a wide result buries the rest of the report.
+    # Counts only - the rows themselves go to the CSV files under -v.
     counted = ", ".join(part for part in (
         f"{left_n:,} only in oracle" if left_n else "",
         f"{right_n:,} only in gcp" if right_n else "") if part)
@@ -808,10 +754,8 @@ def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
               sample: int = 10) -> None:
     """Log the first differing rows and write one file per side.
 
-    Two files rather than one, sorted the same way, so that opening them side
-    by side in an editor shows the differences and nothing else. The values are
-    the ones actually compared, not the raw ones: the same rounding, the same
-    date format, the same shift.
+    Two files, sorted the same way, so comparing them in an editor shows the
+    differences and nothing else. The values are the ones actually compared.
     """
     header = [c.lower() for c in diff.columns]
     sides = {"oracle": sorted(diff.only_oracle, key=_sort_key),
@@ -863,16 +807,14 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     gcp = run_gcp(bq, sql_gcp, limit)
 
     tolerance = tolerance_for(cfg, case.name)
-    shift = float(cfg.get("gcp_time_shift_hours") or 0)
-    status, actual, details, diff = compare_sides(oracle, gcp, decimals, limit,
-                                                  tolerance, shift)
-    # Only with -v: the rows themselves, for reading side by side in a
-    # spreadsheet rather than squinting at a report.
+    status, actual, details, diff = compare_sides(
+        oracle, gcp, decimals, limit, tolerance,
+        int(cfg["defaults"]["timestamp_decimals"]))
+    # With -v, the rows themselves, for reading side by side.
     if diff and LOG.isEnabledFor(logging.DEBUG):
         show_diff(case, diff, out_dir, stamp)
     if not params_oracle or not params_gcp:
-        # Worth saying out loud: such a case ignores the window entirely, so its
-        # result does not change when the dates do.
+        # Such a case ignores the window, so the dates change nothing in it.
         side = "sql_oracle" if not params_oracle else "sql_gcp"
         details = (details + "; " if details else "") + \
             f"no date parameter in {side} - the window was not applied there"
@@ -884,8 +826,7 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
 # 4) Airflow / Cloud Composer  (carried over from v2)
 # --------------------------------------------------------------------------- #
 
-# `project.bronze_sys.table`, project.bronze_sys.table, bronze_sys.table - the
-# dataset is whatever sits one dot before the table name.
+# The dataset is whatever sits one dot before the table name.
 _TABLE_REF = re.compile(
     r"\b(?:FROM|JOIN)\s+`?([A-Za-z0-9_$-]+(?:`?\s*\.\s*`?[A-Za-z0-9_$-]+)+)`?",
     re.IGNORECASE)
@@ -901,10 +842,9 @@ def dataset_of(sql: str) -> str | None:
 
 
 def dag_prefix_of(dataset: str, layer_prefixes: Any) -> str:
-    """The source schema part of a dataset name, as the dag_id spells it.
+    """The schema part of a dataset name, as the dag_id spells it.
 
-    Datasets carry the layer in front of the schema - bronze_sys - while the
-    dag_id wants the schema alone, so the layer is dropped: bronze_sys -> SYS_.
+    The layer in front of it is dropped: bronze_sys -> SYS_.
     """
     name = dataset.upper()
     for prefix in layer_prefixes or []:
@@ -920,8 +860,8 @@ def dag_id_for(tc: dict, af: dict) -> str:
 
         <dag_id_prefix><dag_prefix><TABLE NAME minus a stripped suffix>
 
-    dag_prefix is the source schema; when the config does not give it, it is
-    derived from the dataset in sql_gcp - the only place it appears at all.
+    dag_prefix is the source schema, taken from the sql_gcp dataset when the
+    config does not give it.
     """
     if tc.get("dag_id"):
         return str(tc["dag_id"])
@@ -1079,10 +1019,6 @@ def render_text(reports: list[TableReport], cfg: dict, window: str) -> str:
         f" Location  : {cfg.get('location') or '-'}",
         f" Window    : {window}",
         f" Tables    : {len(reports)}",
-        # Only when set: it changes what "equal" means, so it belongs on the
-        # front page rather than in a config nobody reads with the report.
-        *([f" GCP times : shifted by {cfg['gcp_time_shift_hours']:+}h before comparing"]
-          if cfg.get("gcp_time_shift_hours") else []),
         "",
         f" FINAL TEST STATUS: {overall}",
         "=" * _WIDTH,
@@ -1140,10 +1076,8 @@ def render_text(reports: list[TableReport], cfg: dict, window: str) -> str:
     if issues:
         w_tbl = max(len(t) for t, _ in issues) + 2
         w_sct = max(len(c.section) for _, c in issues) + 2
-        # Wrapped, not cut: this is the part of the report that gets pasted
-        # into a ticket, and half a sentence there helps nobody. The follow-on
-        # lines are indented to under the check name, but never so far that
-        # there is no room left to write in.
+        # Wrapped, not cut - this part gets pasted into a ticket. The indent
+        # stops short of the width so there is room left to write in.
         indent = " " * min(1 + 6 + w_tbl + w_sct, _WIDTH // 3)
         for table, c in issues:
             line = (f" {c.status.ljust(6)}{table.ljust(w_tbl)}{c.section.ljust(w_sct)}"
@@ -1171,8 +1105,7 @@ def write_report(reports: list[TableReport], cfg: dict, window: str,
 def ask_tables() -> list[str] | None:
     """Which tables to test - one name or several separated by commas.
 
-    There is no default and no fallback: the question repeats until a name is
-    given, and whatever is typed goes to the catalogue as it is.
+    No default: the question repeats until a name is given.
     """
     while True:
         try:
@@ -1219,8 +1152,7 @@ def ask_window(cfg: dict) -> tuple[str, str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Loading tests from the metadata catalogue (Oracle + BigQuery)")
-    # Not required, so the installed command can be typed on its own: it picks
-    # up config.yaml from the current directory unless told otherwise.
+    # Not required, so the installed command can be typed on its own.
     ap.add_argument("--config",
                     default=os.environ.get("LOADING_TESTS_CONFIG", "config.yaml"),
                     help="Path to YAML config (default: LOADING_TESTS_CONFIG "
@@ -1252,8 +1184,7 @@ def main(argv: list[str] | None = None) -> int:
 
     to_file = logging.FileHandler(log_path, encoding="utf-8")
     to_screen = logging.StreamHandler(sys.stdout)
-    # The console may be coloured; what lands in the file must not be, or the
-    # log fills up with escape codes.
+    # The console may be coloured; the file must not be.
     to_file.setFormatter(logging.Formatter(layout))
     to_screen.setFormatter((ColourFormatter if colour_works(sys.stdout)
                             else logging.Formatter)(layout))
@@ -1264,9 +1195,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         handlers=handlers)
 
-    # --- Connections first: nothing is worth starting without all three. ---- #
-    # BigQuery goes first because it is the one that may need a browser: better
-    # to find that out before typing two database passwords.
+    # --- Connections first, BigQuery ahead of the rest: it is the one that
+    # may open a browser, and better to learn that before typing passwords. -- #
     bq = connect_bigquery(cfg)
     if bq is None:
         return 2
@@ -1356,8 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
                 rep.add("Runtime", case.name, FAIL,
                         details=f"{type(exc).__name__}: {exc}")
 
-        # The dag_id carries the source schema, and the only place that name
-        # appears is the dataset in sql_gcp - unless the config states it.
+        # The source schema for the dag_id only appears in the sql_gcp dataset.
         tc = table_config(cfg, table)
         af = cfg.get("airflow") or {}
         if not tc.get("dag_id") and not tc.get("dag_prefix"):
