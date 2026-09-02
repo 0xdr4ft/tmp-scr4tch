@@ -10,6 +10,7 @@ dependencies = [
     "google-cloud-bigquery",
     "pyyaml",
     "oracledb",
+    "croniter",
 ]
 
 [project.scripts]

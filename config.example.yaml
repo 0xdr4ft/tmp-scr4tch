@@ -14,6 +14,10 @@ oracle_meta:
     test_case: TEST_CASE
     sql_oracle: SQL_ORACLE
     sql_gcp: SQL_GCP
+  schedule_table: TABLE_REGISTRY    # registry holding each table's Airflow cron
+  schedule_columns:                 # as the registry names them
+    table_name: TABLE_NAME
+    cron_table: LOAD_CRON
 
 # Every sql_oracle runs here. ORACLE_USER / ORACLE_PASSWORD, or asked.
 oracle:
@@ -34,11 +38,15 @@ airflow:
   min_success_ratio_pct: 80
   duration_factor: 2.0
 
-# Hours a test case may differ by, per test case. Only for timestamps: the two
-# sides are not loaded at the same moment, so the newest row is newer on one of
-# them for a while. Anything not listed here has to match exactly.
-tolerance_hours:
-  MAX_TIMESTAMP: 2                  # the test case name, as the catalogue spells it
+# Test cases whose two sides are never read at the same moment: the source keeps
+# moving while bronze waits for its next load, so the newest row is newer there
+# until that load lands. Their tolerance is the largest gap in the table's own
+# cron (from oracle_meta.schedule_table) plus the buffer below - the buffer
+# covers the run itself, a late start and clock skew. A table with no readable
+# schedule is SKIPPED, never guessed at. Every other test case has to match
+# exactly.
+cron_tolerance_cases: [MAX_TIMESTAMP]   # the test case names, as the catalogue spells them
+tolerance_buffer_hours: 0.5
 
 defaults:
   date_from: 2026-06-01             # start offered at the prompt; end = yesterday

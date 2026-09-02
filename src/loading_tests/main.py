@@ -66,6 +66,11 @@ try:
 except ImportError:  # pragma: no cover
     bigquery = None
 
+try:
+    from croniter import croniter
+except ImportError:  # pragma: no cover
+    croniter = None
+
 LOG = logging.getLogger("loading_tests")
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +188,7 @@ class TableReport:
 REQUIRED_DEFAULTS = ("date_from", "max_compare_rows", "float_decimals",
                      "timestamp_decimals")
 CATALOGUE_KEYS = ("table_name", "test_case", "sql_oracle", "sql_gcp")
+SCHEDULE_KEYS = ("table_name", "cron_table")
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -196,6 +202,16 @@ def load_config(path: str) -> dict[str, Any]:
                if cfg["defaults"].get(k) is None]
     missing += [f"oracle_meta.columns.{k}" for k in CATALOGUE_KEYS
                 if not columns.get(k)]
+
+    # The registry is only needed by the test cases that take their tolerance
+    # from the load schedule; without those, none of it has to be filled in.
+    if cfg.get("cron_tolerance_cases"):
+        meta = cfg.get("oracle_meta") or {}
+        if not meta.get("schedule_table"):
+            missing.append("oracle_meta.schedule_table")
+        schedule_cols = meta.get("schedule_columns") or {}
+        missing += [f"oracle_meta.schedule_columns.{k}" for k in SCHEDULE_KEYS
+                    if not schedule_cols.get(k)]
     if missing:
         raise ValueError(f"{path} is missing: {', '.join(missing)}")
     return cfg
@@ -230,15 +246,6 @@ def table_config(cfg: dict, table: str) -> dict:
     merged = dict(cfg["defaults"])
     merged["name"] = table
     return merged
-
-
-def tolerance_for(cfg: dict, test_case: str) -> float:
-    """Hours this test case may differ by, from tolerance_hours in the config."""
-    tolerances = cfg.get("tolerance_hours") or {}
-    for name, hours in tolerances.items():
-        if str(name).strip().upper() == test_case.strip().upper():
-            return float(hours)
-    return 0.0
 
 
 def catalogue_columns(cfg: dict) -> dict[str, str]:
@@ -478,6 +485,162 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
 
 
 # --------------------------------------------------------------------------- #
+# 1b) How often each table is loaded
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Schedule:
+    """What the source-table registry says about how often a table is loaded."""
+    cron: str = ""
+    hours: float | None = None       # largest gap between two runs; None = no usable one
+    state: str = "cron"              # cron | none | unreadable
+    reason: str = ""                 # why there is no usable gap, for the report
+
+
+# The registry writes "no recurring schedule" in more than one way. `None` is
+# how a Python schedule=None ends up in a text column; @once ran a single time.
+_NO_SCHEDULE = {"", "none", "null", "-", "manual", "@once", "@never", "@continuous"}
+
+
+def schedule_table(cfg: dict) -> str:
+    table = (cfg.get("oracle_meta") or {}).get("schedule_table")
+    if not table:
+        raise ValueError("Config needs oracle_meta.schedule_table - the registry "
+                         "holding each table's load schedule")
+    return _oracle_ident(str(table), "schedule table name")
+
+
+def schedule_columns(cfg: dict) -> dict[str, str]:
+    """The registry column names, as the config spells them."""
+    cols = (cfg.get("oracle_meta") or {}).get("schedule_columns") or {}
+    return {k: _oracle_ident(str(cols[k]), f"schedule column {k}")
+            for k in SCHEDULE_KEYS}
+
+
+def cron_gap_hours(expr: str) -> float | None:
+    """The largest gap between two runs of this cron, in hours, or None.
+
+    The gap is what a load may legitimately be behind by, so it is the *largest*
+    one that counts: `0 6 * * 1-5` is a 24h schedule from Tuesday to Friday but
+    a 72h one over the weekend, and a Monday morning test has to survive that.
+
+    Measured from a fixed Monday so the same cron always gives the same number,
+    over enough fires to reach the long gaps of a monthly or yearly schedule.
+    """
+    if croniter is None or not expr:
+        return None
+    try:
+        if not croniter.is_valid(expr):
+            return None
+        base = datetime(2024, 1, 1)                     # a Monday
+        limit = base + timedelta(days=800)
+        clock = croniter(expr, base)
+        previous = clock.get_next(datetime)
+        gap = 0.0
+        for _ in range(400):                            # enough for the long gaps,
+            nxt = clock.get_next(datetime)              # a cap for the dense crons
+            if nxt > limit:
+                break
+            gap = max(gap, (nxt - previous).total_seconds() / 3600)
+            previous = nxt
+    except Exception:                                   # a shape croniter chokes on
+        return None
+    return round(gap, 2) or None
+
+
+def as_schedule(raw: str) -> Schedule:
+    """One registry value turned into hours, or into the reason there are none."""
+    text = (raw or "").strip()
+    if text.lower() in _NO_SCHEDULE:
+        return Schedule(cron=text, state="none",
+                        reason=f"the registry has no recurring schedule for this "
+                               f"table ({text or 'the column is empty'}), so there "
+                               f"is no interval to allow for")
+    hours = cron_gap_hours(text)
+    if hours is None:
+        if croniter is None:
+            return Schedule(cron=text, state="unreadable",
+                            reason="croniter is not installed, so the schedule "
+                                   f"`{text}` cannot be read - `pip install croniter`")
+        return Schedule(cron=text, state="unreadable",
+                        reason=f"the registry holds `{text}`, which is not a cron "
+                               f"this can read - fix it in the metadata")
+    return Schedule(cron=text, hours=hours)
+
+
+def read_schedules(cfg: dict, conn: Any, tables: list[str]) -> dict[str, Schedule]:
+    """The load schedule of each table, by upper-case table name.
+
+    A table with no row of its own is simply absent from the result - that is a
+    different thing from a row whose schedule is empty, and it reads differently
+    in the report.
+    """
+    col = schedule_columns(cfg)
+    binds = {f"t{i}": t.strip().upper()
+             for i, t in enumerate(dict.fromkeys(tables))}
+    placeholders = ", ".join(f":{name}" for name in binds)
+    sql = (f"SELECT {col['table_name']}, {col['cron_table']} "
+           f"FROM {schedule_table(cfg)} "
+           f"WHERE UPPER(TRIM({col['table_name']})) IN ({placeholders})")
+    LOG.debug("Oracle SQL: %s  %s", sql, binds)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, binds)
+        rows = cur.fetchall()
+
+    schedules: dict[str, Schedule] = {}
+    for name, cron in rows:
+        key = str(_lob(name) or "").strip().upper()
+        found = as_schedule(str(_lob(cron) or ""))
+        seen = schedules.get(key)
+        if seen and seen.cron != found.cron:
+            # Two rows, two schedules: the first one wins, but say so out loud.
+            LOG.warning("  %s has more than one schedule in the registry (`%s` and "
+                        "`%s`) - using the first", key, seen.cron, found.cron)
+            continue
+        schedules[key] = found
+    return schedules
+
+
+def describe_schedules(tables: list[str], schedules: dict[str, Schedule]) -> str:
+    """One line on where the tested tables stand, so a gap is visible at once."""
+    labels = {"cron": "from cron", "none": "without a schedule",
+              "unreadable": "unreadable", "missing": "not in the registry"}
+    counts: Counter[str] = Counter()
+    for table in tables:
+        found = schedules.get(table.strip().upper())
+        counts[found.state if found else "missing"] += 1
+    return ", ".join(f"{counts[state]} {label}"
+                     for state, label in labels.items() if counts[state])
+
+
+def tolerance_for(cfg: dict, case: TestCase,
+                  schedules: dict[str, Schedule]) -> tuple[float, str, str]:
+    """(hours, where the hours came from, why this case cannot be run).
+
+    Only the test cases named in cron_tolerance_cases get a tolerance at all -
+    everything else has to match exactly, as it always did. For those that do,
+    the registry is the only source: no schedule, no test.
+    """
+    wanted = {str(n).strip().upper()
+              for n in (cfg.get("cron_tolerance_cases") or [])}
+    if case.name.strip().upper() not in wanted:
+        return 0.0, "", ""
+
+    found = schedules.get(case.table.strip().upper())
+    if found is None:
+        return 0.0, "", (f"{case.table} has no row in the schedule registry - either "
+                         f"it is not registered there, or the name is spelled "
+                         f"differently; the tolerance cannot be worked out")
+    if found.hours is None:
+        return 0.0, "", found.reason
+
+    buffer = float(cfg.get("tolerance_buffer_hours") or 0)
+    return (found.hours + buffer,
+            f"cron {found.cron} = {found.hours:g}h + {buffer:g}h buffer", "")
+
+
+# --------------------------------------------------------------------------- #
 # 2) Date parameters
 # --------------------------------------------------------------------------- #
 
@@ -670,12 +833,13 @@ def reorder(rows: list[tuple], names: list[str], target: list[str]) -> list[tupl
 
 
 def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
-                  tolerance: float = 0,
-                  stamp_decimals: int = 6) -> tuple[str, str, str, Diff | None]:
+                  tolerance: float = 0, stamp_decimals: int = 6,
+                  tolerance_note: str = "") -> tuple[str, str, str, Diff | None]:
     """(status, actual, details, differing rows) for one test case.
 
     The rows come back only when there are any to show. `tolerance` is how
-    many hours two timestamps may differ and still count as equal.
+    many hours two timestamps may differ and still count as equal, and
+    `tolerance_note` says where that number came from.
     """
     broken = [f"{side} query failed: {res.error}"
               for side, res in (("Oracle", oracle), ("GCP", gcp)) if res.error]
@@ -719,16 +883,22 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
 
         # The two sides load at different moments, hence the tolerance.
         if tolerance:
+            allowed = (f"{tolerance:g}h tolerance"
+                       + (f" ({tolerance_note})" if tolerance_note else ""))
             drift = drift_hours(oracle.rows[0][0], gcp.rows[0][0])
             if drift is None:
+                if left is None or right is None:
+                    return with_note(FAIL, actual,
+                                     f"one side has no value at all, so the "
+                                     f"{allowed} has nothing to measure")
                 return with_note(FAIL, actual,
                                  f"values differ and are not timestamps, so the "
-                                 f"{tolerance}h tolerance does not apply")
+                                 f"{allowed} does not apply")
             if drift <= tolerance:
                 return with_note(PASS, actual,
-                                 f"{drift:.2f}h apart, within the {tolerance}h tolerance")
+                                 f"{drift:.2f}h apart, within the {allowed}")
             return with_note(FAIL, actual,
-                             f"{drift:.2f}h apart, more than the {tolerance}h tolerance")
+                             f"{drift:.2f}h apart, more than the {allowed}")
         try:
             apart = Decimal(str(right)) - Decimal(str(left))
             detail = f"difference (gcp - oracle) = {apart:+}"
@@ -800,6 +970,7 @@ def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
 
 
 def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
+                  schedules: dict[str, Schedule],
                   date_from: str, date_to: str, rep: TableReport,
                   out_dir: str = ".", stamp: str = "") -> None:
     decimals = int(cfg["defaults"]["float_decimals"])
@@ -811,6 +982,13 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
                 details=f"the catalogue has no {missing} for this test case")
         return
 
+    # Before the queries run: a case that cannot be judged is not worth paying
+    # BigQuery for.
+    tolerance, tolerance_note, no_schedule = tolerance_for(cfg, case, schedules)
+    if no_schedule:
+        rep.add("Test cases", case.name, SKIP, details=no_schedule)
+        return
+
     sql_oracle, params_oracle = bind_dates(strip_terminator(case.sql_oracle),
                                            date_from, date_to)
     sql_gcp, params_gcp = bind_dates(strip_terminator(case.sql_gcp),
@@ -820,10 +998,9 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     oracle = run_oracle(source, sql_oracle, limit)
     gcp = run_gcp(bq, sql_gcp, limit)
 
-    tolerance = tolerance_for(cfg, case.name)
     status, actual, details, diff = compare_sides(
         oracle, gcp, decimals, limit, tolerance,
-        int(cfg["defaults"]["timestamp_decimals"]))
+        int(cfg["defaults"]["timestamp_decimals"]), tolerance_note)
     # With -v, the rows themselves, for reading side by side.
     if diff and LOG.isEnabledFor(logging.DEBUG):
         show_diff(case, diff, out_dir, stamp)
@@ -1273,6 +1450,22 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     LOG.info("Test cases: %s", ", ".join(sorted({c.name for c in cases})))
 
+    # --- How often those tables are loaded ---------------------------------- #
+    # The registry is the only source of the tolerance, so a table missing from
+    # it means the cases that need one are skipped, with the reason on each.
+    schedules: dict[str, Schedule] = {}
+    if cfg.get("cron_tolerance_cases"):
+        if croniter is None:
+            LOG.warning("croniter is not installed - no schedule can be read, so "
+                        "the test cases needing one will be skipped")
+        try:
+            schedules = read_schedules(cfg, meta, tables)
+        except Exception as exc:
+            LOG.error("Cannot read the load schedules: %s: %s",
+                      type(exc).__name__, exc)
+            LOG.error("Test cases that need one will be skipped.")
+        LOG.info("Schedules: %s", describe_schedules(tables, schedules))
+
     # --- Which window ------------------------------------------------------- #
     if args.date_from or args.date_to:
         try:
@@ -1302,8 +1495,8 @@ def main(argv: list[str] | None = None) -> int:
         table_cases = [c for c in cases if c.table.upper() == table.upper()]
         for case in table_cases:
             try:
-                run_test_case(bq, source, cfg, case, date_from, date_to, rep,
-                              out_dir, stamp)
+                run_test_case(bq, source, cfg, case, schedules,
+                              date_from, date_to, rep, out_dir, stamp)
             except Exception as exc:
                 LOG.exception("Unexpected error in test case %s (%s)", case.name, table)
                 rep.add("Runtime", case.name, FAIL,
