@@ -203,8 +203,7 @@ def load_config(path: str) -> dict[str, Any]:
     missing += [f"oracle_meta.columns.{k}" for k in CATALOGUE_KEYS
                 if not columns.get(k)]
 
-    # The registry is only needed by the test cases that take their tolerance
-    # from the load schedule; without those, none of it has to be filled in.
+    # Only the cases taking their tolerance from a schedule need the registry.
     if cfg.get("cron_tolerance_cases"):
         meta = cfg.get("oracle_meta") or {}
         if not meta.get("schedule_table"):
@@ -497,8 +496,7 @@ class Schedule:
     reason: str = ""                 # why there is no usable gap, for the report
 
 
-# The registry writes "no recurring schedule" in more than one way. `None` is
-# how a Python schedule=None ends up in a text column; @once ran a single time.
+# The ways the registry spells "no recurring schedule". `None` is Python's.
 _NO_SCHEDULE = {"", "none", "null", "-", "manual", "@once", "@never", "@continuous"}
 
 
@@ -520,12 +518,8 @@ def schedule_columns(cfg: dict) -> dict[str, str]:
 def cron_gap_hours(expr: str) -> float | None:
     """The largest gap between two runs of this cron, in hours, or None.
 
-    The gap is what a load may legitimately be behind by, so it is the *largest*
-    one that counts: `0 6 * * 1-5` is a 24h schedule from Tuesday to Friday but
-    a 72h one over the weekend, and a Monday morning test has to survive that.
-
-    Measured from a fixed Monday so the same cron always gives the same number,
-    over enough fires to reach the long gaps of a monthly or yearly schedule.
+    The largest is what counts: `0 6 * * 1-5` waits 72h over the weekend, and a
+    Monday test has to survive that. Measured from a fixed Monday, so it is stable.
     """
     if croniter is None or not expr:
         return None
@@ -865,8 +859,11 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     names = align_columns(oracle, gcp)
     note = ""
     if names is None:
-        note = (f"column names do not match, compared by position: "
-                f"oracle ({', '.join(oracle.columns)}) vs gcp ({', '.join(gcp.columns)})")
+        # One column a side has nothing to line up; two or more, and it does.
+        if len(oracle.columns) > 1:
+            note = (f"column names do not match, compared by position: "
+                    f"oracle ({', '.join(oracle.columns)}) vs "
+                    f"gcp ({', '.join(gcp.columns)})")
     else:
         gcp_rows = reorder(gcp_rows, [str(c).upper() for c in gcp.columns], names)
 
@@ -982,8 +979,7 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
                 details=f"the catalogue has no {missing} for this test case")
         return
 
-    # Before the queries run: a case that cannot be judged is not worth paying
-    # BigQuery for.
+    # First: a case that cannot be judged is not worth paying BigQuery for.
     tolerance, tolerance_note, no_schedule = tolerance_for(cfg, case, schedules)
     if no_schedule:
         rep.add("Test cases", case.name, SKIP, details=no_schedule)
@@ -1451,8 +1447,7 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("Test cases: %s", ", ".join(sorted({c.name for c in cases})))
 
     # --- How often those tables are loaded ---------------------------------- #
-    # The registry is the only source of the tolerance, so a table missing from
-    # it means the cases that need one are skipped, with the reason on each.
+    # The registry is the only source; without one, those cases are skipped.
     schedules: dict[str, Schedule] = {}
     if cfg.get("cron_tolerance_cases"):
         if croniter is None:

@@ -38,15 +38,9 @@ airflow:
   min_success_ratio_pct: 80
   duration_factor: 2.0
 
-# Test cases whose two sides are never read at the same moment: the source keeps
-# moving while bronze waits for its next load, so the newest row is newer there
-# until that load lands. Their tolerance is the largest gap in the table's own
-# cron (from oracle_meta.schedule_table) plus the buffer below - the buffer
-# covers the run itself, a late start and clock skew. A table with no readable
-# schedule is SKIPPED, never guessed at. Every other test case has to match
-# exactly.
-cron_tolerance_cases: [MAX_TIMESTAMP]   # the test case names, as the catalogue spells them
-tolerance_buffer_hours: 0.5
+# Tolerance = largest gap in the table's own cron + buffer; no cron = SKIP.
+cron_tolerance_cases: [MAX_TIMESTAMP]   # as the catalogue spells them
+tolerance_buffer_hours: 0.5             # covers the run itself, a late start, skew
 
 defaults:
   date_from: 2026-06-01             # start offered at the prompt; end = yesterday
