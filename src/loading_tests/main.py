@@ -741,6 +741,20 @@ def bind_dates(sql: str, date_from: str, date_to: str) -> tuple[str, int]:
     return _DATE_PARAM.sub(replace, sql), count
 
 
+# The moment the last load took its cut, for a query that bounds itself by it.
+_RUN_PARAM = re.compile(r"""['"]?[:@]p_last_airflow_run['"]?""", re.IGNORECASE)
+RUN_STAMP_FORMAT = "%Y-%m-%d %H:%M:%S"          # Oracle: RRRR-MM-DD HH24:MI:SS
+
+
+def needs_last_run(sql: str) -> bool:
+    return bool(_RUN_PARAM.search(sql or ""))
+
+
+def bind_last_run(sql: str, stamp: str) -> str:
+    """Put the last run's timestamp in, quoted, the way the window goes in."""
+    return _RUN_PARAM.sub(f"'{stamp}'", sql)
+
+
 # --------------------------------------------------------------------------- #
 # 3) Running one test case on both sides
 # --------------------------------------------------------------------------- #
@@ -1036,7 +1050,7 @@ def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
 
 
 def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
-                  schedules: dict[str, Schedule],
+                  schedules: dict[str, Schedule], last_run: LastRun,
                   date_from: str, date_to: str, rep: TableReport,
                   out_dir: str = ".", stamp: str = "") -> None:
     decimals = int(cfg["defaults"]["float_decimals"])
@@ -1059,6 +1073,16 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     sql_gcp, params_gcp = bind_dates(strip_terminator(case.sql_gcp),
                                      date_from, date_to)
 
+    # A case bounded by the last load: without that moment there is nothing to
+    # compare against, so it is skipped rather than run against the wrong data.
+    bounded = needs_last_run(sql_oracle) or needs_last_run(sql_gcp)
+    if bounded:
+        if not last_run.stamp:
+            rep.add("Test cases", case.name, SKIP, details=last_run.reason)
+            return
+        sql_oracle = bind_last_run(sql_oracle, last_run.stamp)
+        sql_gcp = bind_last_run(sql_gcp, last_run.stamp)
+
     LOG.info("Running test case %s / %s", case.table, case.name)
     oracle = run_oracle(source, sql_oracle, limit)
     gcp = run_gcp(bq, sql_gcp, limit)
@@ -1069,7 +1093,10 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     # With -v, the rows themselves, for reading side by side.
     if diff and LOG.isEnabledFor(logging.DEBUG):
         show_diff(case, diff, out_dir, stamp)
-    if not params_oracle or not params_gcp:
+    if bounded:
+        details = (details + "; " if details else "") + \
+            f"p_last_airflow_run = {last_run.stamp} ({last_run.zone})"
+    elif not params_oracle or not params_gcp:
         # Such a case ignores the window, so the dates change nothing in it.
         side = "sql_oracle" if not params_oracle else "sql_gcp"
         details = (details + "; " if details else "") + \
@@ -1143,21 +1170,44 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
 
 
-def check_airflow(cfg: dict, tc: dict, rep: TableReport) -> None:
+def _run_stamp(stamp: datetime, zone: str) -> datetime:
+    """Airflow answers in UTC; this is the zone the source query reads it in.
+
+    UTC by default, because that is what `normalise` compares in - an aware
+    timestamp from either side ends up there. `local` is for a source that
+    keeps wall-clock time instead.
+    """
+    if stamp.tzinfo is None:
+        return stamp
+    if str(zone).lower() == "local":
+        return stamp.astimezone(LOCAL_TZ) if LOCAL_TZ else stamp.astimezone()
+    return stamp.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+_AIRFLOW_API: Any = None
+
+
+def airflow_api(cfg: dict) -> tuple[Any, str]:
+    """A `get(path, **params)` for the REST API, or the reason there is none.
+
+    Built once and kept, so a run with ten tables opens one session, not ten.
+    """
+    global _AIRFLOW_API
+    if _AIRFLOW_API is not None:
+        return _AIRFLOW_API
+
     af = cfg.get("airflow") or {}
     base_url = af.get("base_url")
     if not af.get("enabled", True) or not base_url:
-        rep.add("Airflow", "DAG status", SKIP, details="Airflow not configured")
-        return
-
+        _AIRFLOW_API = (None, "Airflow not configured")
+        return _AIRFLOW_API
     try:
         from google.auth import default as google_auth_default
         from google.auth.transport.requests import AuthorizedSession
     except ImportError:
-        rep.add("Airflow", "DAG status", SKIP, details="google-auth not installed")
-        return
+        _AIRFLOW_API = (None, "google-auth not installed")
+        return _AIRFLOW_API
 
-    dag_id = dag_id_for(tc, af)
     api = f"{base_url.rstrip('/')}/api/{af.get('api_version', 'v2')}"
     creds, _ = google_auth_default(
         scopes=["https://www.googleapis.com/auth/cloud-platform"])
@@ -1178,6 +1228,61 @@ def check_airflow(cfg: dict, tc: dict, rep: TableReport) -> None:
         r.raise_for_status()
         return r.json()
 
+    _AIRFLOW_API = (get, "")
+    return _AIRFLOW_API
+
+
+@dataclass
+class LastRun:
+    """When the last load took its cut, spelled the way the data spells time.
+
+    One spelling for both sides, because both sides store the same one - which
+    is the premise the whole comparison rests on, and what it checks every run.
+    """
+    stamp: str = ""
+    zone: str = "utc"                # utc | local, whichever the data keeps
+    reason: str = ""                 # why there is no moment at all
+
+
+def last_airflow_run(cfg: dict, tc: dict) -> LastRun:
+    """When the last load took its cut, or the reason there is no such moment.
+
+    Successful runs only: a failed or still running one has moved no data, so
+    bounding the source by it would hide rows that never reached bronze.
+    """
+    af = cfg.get("airflow") or {}
+    zone = str(af.get("last_run_tz", "utc"))
+    get, why = airflow_api(cfg)
+    dag_id = dag_id_for(tc, af)
+    if get is None:
+        return LastRun(reason=f":p_last_airflow_run needs Airflow, and {why}")
+
+    field_name = str(af.get("last_run_field", "start_date"))
+    try:
+        runs = get(f"/dags/{dag_id}/dagRuns", order_by="-logical_date",
+                   limit=int(af.get("history_runs", 10)))
+    except Exception as exc:
+        return LastRun(reason=f"the runs of {dag_id} could not be read: {exc}")
+
+    for run in runs.get("dag_runs", []):
+        if run.get("state") != "success":
+            continue
+        stamp = _parse_ts(run.get(field_name))
+        if stamp:
+            return LastRun(stamp=_run_stamp(stamp, zone).strftime(RUN_STAMP_FORMAT),
+                           zone=zone)
+    return LastRun(reason=f"{dag_id} has no successful run with a {field_name} "
+                          f"among the last {af.get('history_runs', 10)}")
+
+
+def check_airflow(cfg: dict, tc: dict, rep: TableReport) -> None:
+    af = cfg.get("airflow") or {}
+    get, why = airflow_api(cfg)
+    if get is None:
+        rep.add("Airflow", "DAG status", SKIP, details=why)
+        return
+
+    dag_id = dag_id_for(tc, af)
     limit = int(af.get("history_runs", 10))
     try:
         runs = get(f"/dags/{dag_id}/dagRuns", order_by="-logical_date", limit=limit)
@@ -1564,14 +1669,6 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("=" * 78)
 
         table_cases = [c for c in cases if c.table.upper() == table.upper()]
-        for case in table_cases:
-            try:
-                run_test_case(bq, source, cfg, case, schedules,
-                              date_from, date_to, rep, out_dir, stamp)
-            except Exception as exc:
-                LOG.exception("Unexpected error in test case %s (%s)", case.name, table)
-                rep.add("Runtime", case.name, FAIL,
-                        details=f"{type(exc).__name__}: {exc}")
 
         # The source schema for the dag_id only appears in the sql_gcp dataset.
         tc = table_config(cfg, table)
@@ -1584,6 +1681,25 @@ def main(argv: list[str] | None = None) -> int:
                 LOG.info("  dag_id from dataset %s: %s", dataset, dag_id_for(tc, af))
             else:
                 LOG.warning("  no dataset found in sql_gcp - dag_id without the schema")
+
+        # Asked for only when a test case names it, so nobody pays for it twice.
+        last_run = LastRun()
+        if any(needs_last_run(c.sql_oracle) or needs_last_run(c.sql_gcp)
+               for c in table_cases):
+            last_run = last_airflow_run(cfg, tc)
+            LOG.info("  p_last_airflow_run = %s",
+                     f"{last_run.stamp} ({last_run.zone})" if last_run.stamp
+                     else f"none: {last_run.reason}")
+
+        for case in table_cases:
+            try:
+                run_test_case(bq, source, cfg, case, schedules, last_run,
+                              date_from, date_to, rep, out_dir, stamp)
+            except Exception as exc:
+                LOG.exception("Unexpected error in test case %s (%s)", case.name, table)
+                rep.add("Runtime", case.name, FAIL,
+                        details=f"{type(exc).__name__}: {exc}")
+
         try:
             check_airflow(cfg, tc, rep)
         except Exception as exc:
