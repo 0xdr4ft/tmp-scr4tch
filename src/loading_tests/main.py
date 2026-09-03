@@ -157,6 +157,7 @@ class TableReport:
     table: str
     started_at: datetime
     window: str = ""
+    load: str = ""                   # FULL / INCREMENTAL, from the source registry
     results: list[CheckResult] = field(default_factory=list)
     finished_at: datetime | None = None
 
@@ -188,7 +189,9 @@ class TableReport:
 REQUIRED_DEFAULTS = ("date_from", "max_compare_rows", "float_decimals",
                      "timestamp_decimals")
 CATALOGUE_KEYS = ("table_name", "test_case", "sql_oracle", "sql_gcp")
-SCHEDULE_KEYS = ("table_name", "cron_table")
+REGISTRY_KEYS = ("table_name", "cron_table")
+# Shown, never acted on: the catalogue SQL already knows how the table loads.
+REGISTRY_EXTRAS = ("extract_method",)
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -206,11 +209,11 @@ def load_config(path: str) -> dict[str, Any]:
     # Only the cases taking their tolerance from a schedule need the registry.
     if cfg.get("cron_tolerance_cases"):
         meta = cfg.get("oracle_meta") or {}
-        if not meta.get("schedule_table"):
-            missing.append("oracle_meta.schedule_table")
-        schedule_cols = meta.get("schedule_columns") or {}
-        missing += [f"oracle_meta.schedule_columns.{k}" for k in SCHEDULE_KEYS
-                    if not schedule_cols.get(k)]
+        if not meta.get("source_registry"):
+            missing.append("oracle_meta.source_registry")
+        registry_cols = meta.get("registry_columns") or {}
+        missing += [f"oracle_meta.registry_columns.{k}" for k in REGISTRY_KEYS
+                    if not registry_cols.get(k)]
     if missing:
         raise ValueError(f"{path} is missing: {', '.join(missing)}")
     return cfg
@@ -546,30 +549,35 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
 
 @dataclass
 class Schedule:
-    """What the source-table registry says about how often a table is loaded."""
+    """What the source registry says about how a table is loaded."""
     cron: str = ""
     hours: float | None = None       # largest gap between two runs; None = no usable one
     state: str = "cron"              # cron | none | unreadable
     reason: str = ""                 # why there is no usable gap, for the report
+    extract: str = ""                # FULL / INCREMENTAL, shown but never acted on
 
 
 # The ways the registry spells "no recurring schedule". `None` is Python's.
 _NO_SCHEDULE = {"", "none", "null", "-", "manual", "@once", "@never", "@continuous"}
 
 
-def schedule_table(cfg: dict) -> str:
-    table = (cfg.get("oracle_meta") or {}).get("schedule_table")
+def source_registry(cfg: dict) -> str:
+    table = (cfg.get("oracle_meta") or {}).get("source_registry")
     if not table:
-        raise ValueError("Config needs oracle_meta.schedule_table - the registry "
+        raise ValueError("Config needs oracle_meta.source_registry - the registry "
                          "holding each table's load schedule")
-    return _oracle_ident(str(table), "schedule table name")
+    return _oracle_ident(str(table), "source registry name")
 
 
-def schedule_columns(cfg: dict) -> dict[str, str]:
-    """The registry column names, as the config spells them."""
-    cols = (cfg.get("oracle_meta") or {}).get("schedule_columns") or {}
-    return {k: _oracle_ident(str(cols[k]), f"schedule column {k}")
-            for k in SCHEDULE_KEYS}
+def registry_columns(cfg: dict) -> dict[str, str]:
+    """The registry column names, as the config spells them.
+
+    The extras are only there when the config names them; nothing breaks
+    without one, the report simply says less.
+    """
+    cols = (cfg.get("oracle_meta") or {}).get("registry_columns") or {}
+    wanted = REGISTRY_KEYS + tuple(k for k in REGISTRY_EXTRAS if cols.get(k))
+    return {k: _oracle_ident(str(cols[k]), f"registry column {k}") for k in wanted}
 
 
 def cron_gap_hours(expr: str) -> float | None:
@@ -626,12 +634,14 @@ def read_schedules(cfg: dict, conn: Any, tables: list[str]) -> dict[str, Schedul
     different thing from a row whose schedule is empty, and it reads differently
     in the report.
     """
-    col = schedule_columns(cfg)
+    col = registry_columns(cfg)
+    extract = col.get("extract_method")
     binds = {f"t{i}": t.strip().upper()
              for i, t in enumerate(dict.fromkeys(tables))}
     placeholders = ", ".join(f":{name}" for name in binds)
-    sql = (f"SELECT {col['table_name']}, {col['cron_table']} "
-           f"FROM {schedule_table(cfg)} "
+    sql = (f"SELECT {col['table_name']}, {col['cron_table']}"
+           + (f", {extract}" if extract else "") +
+           f" FROM {source_registry(cfg)} "
            f"WHERE UPPER(TRIM({col['table_name']})) IN ({placeholders})")
     LOG.debug("Oracle SQL: %s  %s", sql, binds)
 
@@ -640,9 +650,11 @@ def read_schedules(cfg: dict, conn: Any, tables: list[str]) -> dict[str, Schedul
         rows = cur.fetchall()
 
     schedules: dict[str, Schedule] = {}
-    for name, cron in rows:
+    for row in rows:
+        name, cron = row[0], row[1]
         key = str(_lob(name) or "").strip().upper()
         found = as_schedule(str(_lob(cron) or ""))
+        found.extract = str(_lob(row[2]) or "").strip() if extract else ""
         seen = schedules.get(key)
         if seen and seen.cron != found.cron:
             # Two rows, two schedules: the first one wins, but say so out loud.
@@ -680,7 +692,7 @@ def tolerance_for(cfg: dict, case: TestCase,
 
     found = schedules.get(case.table.strip().upper())
     if found is None:
-        return 0.0, "", (f"{case.table} has no row in the schedule registry - either "
+        return 0.0, "", (f"{case.table} has no row in the source registry - either "
                          f"it is not registered there, or the name is spelled "
                          f"differently; the tolerance cannot be worked out")
     if found.hours is None:
@@ -1292,8 +1304,9 @@ def render_text(reports: list[TableReport], cfg: dict, window: str) -> str:
                 f" {title}".ljust(_WIDTH - len(r.final_status) - 1) + " " + r.final_status,
                 "=" * _WIDTH]
         dur = (r.finished_at - r.started_at).total_seconds() if r.finished_at else 0
-        out += [f" test cases = {r.cases} | window = {r.window or '-'}"
-                f" | duration = {dur:.1f}s", ""]
+        out += [f" test cases = {r.cases}"
+                + (f" | load = {r.load}" if r.load else "")
+                + f" | window = {r.window or '-'} | duration = {dur:.1f}s", ""]
 
         w_name = max([len("CHECK")] + [len(c.name) for c in r.results]) + 2
         w_exp = max([len("EXPECTED")] + [len(c.expected or "-") for c in r.results]) + 2
@@ -1540,9 +1553,14 @@ def main(argv: list[str] | None = None) -> int:
     # --- Run ---------------------------------------------------------------- #
     reports = []
     for table in tables:
-        rep = TableReport(table=table, started_at=now_local(), window=window)
+        found = schedules.get(table.strip().upper())
+        known = ", ".join(part for part in (
+            found.extract if found else "",
+            f"cron {found.cron}" if found and found.cron else "") if part)
+        rep = TableReport(table=table, started_at=now_local(), window=window,
+                          load=found.extract if found else "")
         LOG.info("=" * 78)
-        LOG.info("Testing table: %s", table)
+        LOG.info("Testing table: %s%s", table, f" ({known})" if known else "")
         LOG.info("=" * 78)
 
         table_cases = [c for c in cases if c.table.upper() == table.upper()]

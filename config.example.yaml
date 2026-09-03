@@ -14,10 +14,11 @@ oracle_meta:
     test_case: TEST_CASE
     sql_oracle: SQL_ORACLE
     sql_gcp: SQL_GCP
-  schedule_table: TABLE_REGISTRY    # registry holding each table's Airflow cron
-  schedule_columns:                 # as the registry names them
+  source_registry: TABLE_REGISTRY   # per-table load metadata: cron, extract method
+  registry_columns:                 # as the registry names them
     table_name: TABLE_NAME
     cron_table: LOAD_CRON
+    extract_method: EXTRACT_METHOD  # optional: FULL / INCREMENTAL, shown in the report
 
 # Every sql_oracle runs here. ORACLE_USER / ORACLE_PASSWORD, or asked.
 oracle:
