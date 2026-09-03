@@ -38,10 +38,9 @@ airflow:
   history_runs: 10
   min_success_ratio_pct: 80
   duration_factor: 2.0
-  last_run_field: start_date        # :p_last_airflow_run from the last successful
-                                    # run: start_date | end_date | logical_date
-  last_run_tz: local                # zone the compared columns are written in,
-                                    # both sides alike: utc | local
+  # :p_last_airflow_run: which moment of the last successful run, in which zone.
+  last_run_field: start_date        # start_date | end_date | logical_date
+  last_run_tz: local                # utc | local, as the compared columns keep it
 
 # Tolerance = largest gap in the table's own cron + buffer; no cron = SKIP.
 cron_tolerance_cases: [MAX_TIMESTAMP]   # as the catalogue spells them

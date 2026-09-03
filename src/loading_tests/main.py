@@ -1687,9 +1687,6 @@ def main(argv: list[str] | None = None) -> int:
         if any(needs_last_run(c.sql_oracle) or needs_last_run(c.sql_gcp)
                for c in table_cases):
             last_run = last_airflow_run(cfg, tc)
-            LOG.info("  p_last_airflow_run = %s",
-                     f"{last_run.stamp} ({last_run.zone})" if last_run.stamp
-                     else f"none: {last_run.reason}")
 
         for case in table_cases:
             try:
