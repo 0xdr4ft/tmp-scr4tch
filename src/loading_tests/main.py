@@ -235,6 +235,38 @@ def find_config(given: str | None) -> str:
     return here                          # so the error names the obvious place
 
 
+def load_env_file(config_path: str) -> str:
+    """Read a `.env` next to the config into the environment; return the file used.
+
+    `KEY=VALUE` a line, `#` starts a comment line only - a value may contain one,
+    passwords being what they are. What is already exported wins, so a variable
+    set in the shell still beats the file.
+    """
+    here = os.path.dirname(os.path.abspath(config_path))
+    path = next((p for p in (os.path.join(here, ".env"),
+                             os.path.join(os.getcwd(), ".env")) if os.path.isfile(p)), "")
+    if not path:
+        return ""
+    # Windows keeps its permissions in the ACL, not in the mode bits.
+    if os.name == "posix" and os.stat(path).st_mode & 0o077:
+        LOG.warning("%s can be read by other users - `chmod 600` it", path)
+
+    taken = []
+    # utf-8-sig: Notepad writes a BOM, which would glue itself to the first name.
+    with open(path, "r", encoding="utf-8-sig") as fh:
+        for line in fh:
+            line = line.strip().removeprefix("export ")
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            name, value = name.strip(), value.strip().strip("\"'")
+            if name and name not in os.environ:
+                os.environ[name] = value
+                taken.append(name)
+    LOG.info("Env: %s from %s", ", ".join(taken) or "nothing", path)
+    return path
+
+
 def table_config(cfg: dict, table: str) -> dict:
     """Per-table settings (Airflow naming), matched without regard to case."""
     for t in cfg.get("tables", []):
@@ -279,11 +311,22 @@ def _oracle_dsn(block: dict) -> str:
     return f"{host}:{block.get('port', 1521)}/{service}"
 
 
+PASSWORD_TRIES = 3
+
+
+def _bad_password(exc: Exception) -> bool:
+    """Wrong credentials, the one failure that typing them again can fix."""
+    text = f"{exc}".lower()
+    return "ora-01017" in text or "logon denied" in text
+
+
 def oracle_connect(cfg: dict, key: str) -> Any:
     """Connect to the database configured under `key`, asking once per run.
 
     Credentials come from the environment first (<KEY>_USER / <KEY>_PASSWORD,
-    e.g. ORACLE_META_USER), then from the config, then from the terminal.
+    e.g. ORACLE_META_USER), then from the config, then from the terminal. A
+    password typed at the terminal can be typed again; one that came from the
+    environment cannot, so that a run nobody is watching still fails at once.
     """
     if key in _CONNECTIONS:
         return _CONNECTIONS[key]
@@ -301,18 +344,32 @@ def oracle_connect(cfg: dict, key: str) -> Any:
 
     user = (os.environ.get(f"{prefix}_USER") or block.get("user")
             or input(f"User for {label} ({dsn}): ").strip())
-    password = (os.environ.get(f"{prefix}_PASSWORD")
-                or getpass.getpass(f"Password for {user}@{label}: "))
+    password = os.environ.get(f"{prefix}_PASSWORD") or ""
+    tries = 1 if password or not sys.stdin.isatty() else PASSWORD_TRIES
 
     LOG.info("Connecting to %s (%s) as %s", label, dsn, user)
-    try:
-        conn = oracledb.connect(user=user, password=password, dsn=dsn)
-    except Exception as exc:
-        _CONNECT_ERRORS[key] = exc
-        raise
-    _CONNECTIONS[key] = conn
-    LOG.info("Connected to %s (Oracle %s)", label, conn.version)
-    return conn
+    for attempt in range(1, tries + 1):
+        if not password:
+            password = getpass.getpass(f"Password for {user}@{label}: ")
+        if not password:
+            break                          # Enter on its own: the user gives up
+        try:
+            conn = oracledb.connect(user=user, password=password, dsn=dsn)
+        except Exception as exc:
+            if attempt == tries or not _bad_password(exc):
+                _CONNECT_ERRORS[key] = exc
+                raise
+            LOG.warning("Wrong password for %s - attempt %d of %d, mind the "
+                        "lockout", user, attempt, tries)
+            password = ""
+            continue
+        _CONNECTIONS[key] = conn
+        LOG.info("Connected to %s (Oracle %s)", label, conn.version)
+        return conn
+
+    error = _CONNECT_ERRORS.get(key) or ValueError(f"No password given for {label}")
+    _CONNECT_ERRORS[key] = error
+    raise error
 
 
 def oracle_close_all() -> None:
@@ -1390,6 +1447,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         handlers=handlers)
     LOG.info("Config: %s", os.path.abspath(config_path))
+    load_env_file(config_path)
 
     # --- Connections first, BigQuery ahead of the rest: it is the one that
     # may open a browser, and better to learn that before typing passwords. -- #

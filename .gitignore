@@ -1,4 +1,5 @@
 config.yaml
+.env
 reports/
 __pycache__/
 .venv/
