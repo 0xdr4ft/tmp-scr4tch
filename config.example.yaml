@@ -52,8 +52,22 @@ frameworks:
   FRAMEWORK_A: [SOURCE_TYPE_A]
   FRAMEWORK_B: [SOURCE_TYPE_B, SOURCE_TYPE_C]
 
-# Which of them this build has tests for; the rest are skipped with a reason.
-implemented_frameworks: [FRAMEWORK_A]
+# Which of them this build tests, and how. `compare` needs a source and the test
+# catalogue; `standalone` asks the target alone. Anything else is skipped.
+implemented_frameworks:
+  FRAMEWORK_A: compare
+  FRAMEWORK_B: standalone
+
+# For the standalone frameworks: where the tables are and what counts as fresh.
+standalone:
+  layers: [BRONZE, SILVER, GOLD]
+  dataset_pattern: "{layer}_{system}"   # dataset holding one layer of one system
+  lowercase_datasets: true
+  table_suffixes: [_raw, _std]
+  hours: 24                             # the window for ROWS_LAST_HOURS
+  min_rows: 1                           # fewer than this in the window is a FAIL
+  max_age_hours: 24                     # newest row older than this is a FAIL
+  loaded_at_columns: [AUDIT_INSERT_TS, LOADED_AT, INSERT_TS]
 
 # Where results go, on the oracle_meta connection. Off until the user has INSERT.
 results:
