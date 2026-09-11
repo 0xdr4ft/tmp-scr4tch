@@ -13,7 +13,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from .main import (FAIL, PASS, SKIP, CheckResult, TableReport, now_local)
+from .main import (FAIL, PASS, SKIP, CheckResult, TableReport, check_airflow,
+                   now_local)
 
 LOG = logging.getLogger("loading_tests")
 
@@ -72,6 +73,16 @@ def dataset_for(cfg: dict, layer: str, system: str) -> str:
     if own.get("lowercase_datasets", True):
         name = name.lower()
     return _identifier(name, "dataset name")
+
+
+def dag_for(cfg: dict, layer: str, system: str) -> str:
+    """The DAG loading one layer of one system, as the config spells it."""
+    own = cfg.get("standalone") or {}
+    pattern = str(own.get("dag_pattern") or "")
+    if not pattern:
+        return ""
+    name = pattern.format(layer=layer, system=system)
+    return name.lower() if own.get("dag_lowercase", True) else name
 
 
 def read_tables(bq: Any, project: str, dataset: str,
@@ -222,6 +233,7 @@ def test_table(bq: Any, cfg: dict, project: str, dataset: str, table: str,
         rep.finished_at = now_local()
         return rep
 
+    LOG.info("  %s", _measured_by(col))
     hours = int(own.get("hours", 24))
     zone = _zone(own.get("timezone") or "UTC")
     for check in (check_rows_last_hours(bq, project, dataset, table, col, hours,
@@ -251,11 +263,31 @@ def run_system(bq: Any, cfg: dict, system: str, layer: str) -> list[TableReport]
     LOG.info("Tables: %s", ", ".join(tables))
     columns = read_columns(bq, project, dataset)
 
+    # The whole picture first: which table is measured by what, or by nothing.
+    named = own.get("loaded_at_columns") or []
+    LOG.info("Measured by: %s", ", ".join(
+        f"{t} -> {c.name or 'nothing: ' + c.reason}"
+        for t in tables for c in [time_column(columns.get(t, []), named)]))
+
     reports = []
     for table in tables:
         LOG.info("=" * 78)
         LOG.info("Testing table: %s.%s", dataset, table)
         LOG.info("=" * 78)
         reports.append(test_table(bq, cfg, project, dataset, table,
-                                  columns.get(table, set()), layer, system))
+                                  columns.get(table, []), layer, system))
+
+    # One DAG loads the whole layer, so its checks are not any one table's.
+    dag = dag_for(cfg, layer, system)
+    if dag:
+        LOG.info("=" * 78)
+        LOG.info("Airflow DAG: %s", dag)
+        LOG.info("=" * 78)
+        rep = TableReport(table=dataset, started_at=now_local())
+        try:
+            check_airflow(cfg, {"name": dataset, "dag_id": dag}, rep)
+        except Exception as exc:
+            rep.add("Runtime", "Airflow", FAIL, details=f"{type(exc).__name__}: {exc}")
+        rep.finished_at = now_local()
+        reports.append(rep)
     return reports

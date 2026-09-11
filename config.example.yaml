@@ -64,6 +64,8 @@ standalone:
   dataset_pattern: "{layer}_{system}"   # dataset holding one layer of one system
   lowercase_datasets: true
   table_suffixes: [_raw, _std]
+  dag_pattern: "{layer}_{system}_LOAD"  # one DAG per layer and system; "" to skip
+  dag_lowercase: true
   hours: 24                             # the window for ROWS_LAST_HOURS
   min_rows: 1                           # fewer than this in the window is a FAIL
   max_age_hours: 24                     # newest row older than this is a FAIL
