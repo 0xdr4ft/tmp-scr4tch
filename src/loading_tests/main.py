@@ -1217,7 +1217,10 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
     if cfg.get("frameworks"):
         can = {str(f).strip().lower()
                for f in (cfg.get("implemented_frameworks") or [])}
-        if found is None:
+        if not registry:
+            why = ("the table registry could not be read, or it returned nothing "
+                   "at all - see the `Cannot read the table registry` line")
+        elif found is None:
             why = f"{case.table} has no row in the table registry"
         elif found.reason:
             why = found.reason
@@ -1709,6 +1712,18 @@ def save_results(cfg: dict, conn: Any, rep: TableReport, info: TableInfo | None,
         f":started, :finished, :win_from, :win_to, :run_by, :status) "
         f"RETURNING {head}ID INTO :run_id")
 
+    try:
+        _insert_results(conn, rep, info, res, header, rows, line, head,
+                        layer, date_from, date_to)
+    except Exception:
+        # Half a run recorded is worse than none: the next commit would keep it.
+        conn.rollback()
+        raise
+
+
+def _insert_results(conn: Any, rep: TableReport, info: TableInfo, res: dict,
+                    header: str, rows: str, line: str, head: str, layer: str,
+                    date_from: str, date_to: str) -> None:
     with conn.cursor() as cur:
         run_id = cur.var(int)
         cur.execute(header, {
