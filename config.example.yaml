@@ -67,7 +67,9 @@ standalone:
   hours: 24                             # the window for ROWS_LAST_HOURS
   min_rows: 1                           # fewer than this in the window is a FAIL
   max_age_hours: 24                     # newest row older than this is a FAIL
-  loaded_at_columns: [AUDIT_INSERT_TS, LOADED_AT, INSERT_TS]
+  # Fallback for tables not partitioned by time. Usually left empty: the
+  # partitioning column is asked for first and no two tables need to agree.
+  loaded_at_columns: []
 
 # Where results go, on the oracle_meta connection. Off until the user has INSERT.
 results:

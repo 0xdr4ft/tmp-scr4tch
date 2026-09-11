@@ -968,9 +968,13 @@ def run_comparison(bq: BQ, meta: Any, source: Any, cfg: dict, typed: list[str],
         reports.append(rep)
 
         try:
-            save_results(cfg, meta, rep, found,
-                         layer=layer_of(dataset, af.get("dataset_layer_prefixes")),
-                         date_from=date_from, date_to=date_to)
+            save_results(cfg, meta, rep,
+                         found.framework if found else "",
+                         found.source if found else "",
+                         layer_of(dataset, af.get("dataset_layer_prefixes")),
+                         date_from, date_to,
+                         reason=(found.reason if found else
+                                 "no row in the table registry"))
         except Exception as exc:
             LOG.warning("  results not saved for %s: %s: %s",
                         table, type(exc).__name__, exc)

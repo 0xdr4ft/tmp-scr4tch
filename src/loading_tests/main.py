@@ -1004,7 +1004,8 @@ def _insert_results(conn: Any, rep: TableReport, framework: str, source: str,
     with conn.cursor() as cur:
         run_id = cur.var(int)
         cur.execute(header, {
-            "framework": framework,
+            # One spelling, whichever path got here: the column is queried on it.
+            "framework": str(framework).strip().lower(),
             "environment": str(res.get("environment") or "").strip().upper(),
             "layer": _fit(layer.upper(), 20),
             "source": _fit(source, 128),
