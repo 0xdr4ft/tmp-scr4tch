@@ -14,11 +14,16 @@ oracle_meta:
     test_case: TEST_CASE
     sql_oracle: SQL_ORACLE
     sql_gcp: SQL_GCP
-  source_registry: TABLE_REGISTRY   # per-table load metadata: cron, extract method
+  table_registry: TABLE_REGISTRY    # per-table load metadata: cron, extract, source
   registry_columns:                 # as the registry names them
     table_name: TABLE_NAME
     cron_table: LOAD_CRON
     extract_method: EXTRACT_METHOD  # optional: FULL / INCREMENTAL, shown in the report
+    source_name: SOURCE_NAME        # joins the table to the source registry
+  source_registry: SOURCE_REGISTRY  # each source and its type
+  source_columns:
+    source_name: SOURCE_NAME
+    source_type: SOURCE_TYPE
 
 # Every sql_oracle runs here. ORACLE_USER / ORACLE_PASSWORD, or asked.
 oracle:
@@ -41,6 +46,23 @@ airflow:
   # :p_last_airflow_run: which moment of the last successful run, in which zone.
   last_run_field: start_date        # start_date | end_date | logical_date
   last_run_tz: local                # utc | local, as the compared columns keep it
+
+# Framework -> its source types, matched any case. Read from the metadata.
+frameworks:
+  FRAMEWORK_A: [SOURCE_TYPE_A]
+  FRAMEWORK_B: [SOURCE_TYPE_B, SOURCE_TYPE_C]
+
+# Which of them this build has tests for; the rest are skipped with a reason.
+implemented_frameworks: [FRAMEWORK_A]
+
+# Where results go, on the oracle_meta connection. Off until the user has INSERT.
+results:
+  enabled: false
+  environment: PROD                 # DEV | TEST | PROD
+  runs_table: TEST_CASE_RUNS        # header: one row per table per run
+  results_table: TEST_CASE_RESULTS  # one row per check
+  runs_column_prefix: RUN_          # every column is <prefix><NAME>
+  results_column_prefix: RES_
 
 # Tolerance = largest gap in the table's own cron + buffer; no cron = SKIP.
 cron_tolerance_cases: [MAX_TIMESTAMP]   # as the catalogue spells them

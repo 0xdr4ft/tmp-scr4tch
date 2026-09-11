@@ -53,6 +53,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -150,6 +151,17 @@ class CheckResult:
     expected: str = ""
     actual: str = ""
     details: str = ""
+    # For the results table. Empty wherever the check has nothing of the kind.
+    load_type: str = ""
+    cron: str = ""
+    tolerance_h: float | None = None
+    last_load_at: str = ""
+    rows_source: int | None = None
+    rows_target: int | None = None
+    rows_identical: int | None = None
+    rows_discrepancies: int | None = None
+    diff_columns: str = ""
+    duration_s: float | None = None
 
 
 @dataclass
@@ -190,8 +202,9 @@ REQUIRED_DEFAULTS = ("date_from", "max_compare_rows", "float_decimals",
                      "timestamp_decimals")
 CATALOGUE_KEYS = ("table_name", "test_case", "sql_oracle", "sql_gcp")
 REGISTRY_KEYS = ("table_name", "cron_table")
-# Shown, never acted on: the catalogue SQL already knows how the table loads.
-REGISTRY_EXTRAS = ("extract_method",)
+# Only there when the config names them; without one the report says less.
+REGISTRY_EXTRAS = ("extract_method", "source_name")
+SOURCE_KEYS = ("source_name", "source_type")
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -206,14 +219,26 @@ def load_config(path: str) -> dict[str, Any]:
     missing += [f"oracle_meta.columns.{k}" for k in CATALOGUE_KEYS
                 if not columns.get(k)]
 
+    meta = cfg.get("oracle_meta") or {}
+    registry_cols = meta.get("registry_columns") or {}
     # Only the cases taking their tolerance from a schedule need the registry.
     if cfg.get("cron_tolerance_cases"):
-        meta = cfg.get("oracle_meta") or {}
-        if not meta.get("source_registry"):
-            missing.append("oracle_meta.source_registry")
-        registry_cols = meta.get("registry_columns") or {}
+        if not meta.get("table_registry"):
+            missing.append("oracle_meta.table_registry")
         missing += [f"oracle_meta.registry_columns.{k}" for k in REGISTRY_KEYS
                     if not registry_cols.get(k)]
+
+    # The framework is read from the metadata, so all of this has to be named.
+    if cfg.get("frameworks"):
+        if not meta.get("source_registry"):
+            missing.append("oracle_meta.source_registry")
+        if not registry_cols.get("source_name"):
+            missing.append("oracle_meta.registry_columns.source_name")
+        source_cols = meta.get("source_columns") or {}
+        missing += [f"oracle_meta.source_columns.{k}" for k in SOURCE_KEYS
+                    if not source_cols.get(k)]
+    elif (cfg.get("results") or {}).get("enabled"):
+        missing.append("frameworks (results need one, and it comes from the metadata)")
     if missing:
         raise ValueError(f"{path} is missing: {', '.join(missing)}")
     return cfg
@@ -549,28 +574,46 @@ def read_catalogue(cfg: dict, conn: Any, tables: list[str]) -> list[TestCase]:
 
 @dataclass
 class Schedule:
-    """What the source registry says about how a table is loaded."""
+    """What the registry says about how often a table is loaded."""
     cron: str = ""
     hours: float | None = None       # largest gap between two runs; None = no usable one
     state: str = "cron"              # cron | none | unreadable
     reason: str = ""                 # why there is no usable gap, for the report
+
+
+@dataclass
+class TableInfo:
+    """One table as the metadata describes it: how, how often, from where."""
+    schedule: Schedule = field(default_factory=Schedule)
     extract: str = ""                # FULL / INCREMENTAL, shown but never acted on
+    source: str = ""                 # the source system this table comes from
+    source_type: str = ""            # as the source registry spells it
+    framework: str = ""              # worked out from source_type, as config names it
+    reason: str = ""                 # why the framework could not be worked out
 
 
 # The ways the registry spells "no recurring schedule". `None` is Python's.
 _NO_SCHEDULE = {"", "none", "null", "-", "manual", "@once", "@never", "@continuous"}
 
 
+def table_registry(cfg: dict) -> str:
+    table = (cfg.get("oracle_meta") or {}).get("table_registry")
+    if not table:
+        raise ValueError("Config needs oracle_meta.table_registry - the registry "
+                         "holding each table's load metadata")
+    return _oracle_ident(str(table), "table registry name")
+
+
 def source_registry(cfg: dict) -> str:
     table = (cfg.get("oracle_meta") or {}).get("source_registry")
     if not table:
         raise ValueError("Config needs oracle_meta.source_registry - the registry "
-                         "holding each table's load schedule")
+                         "naming each source and its type")
     return _oracle_ident(str(table), "source registry name")
 
 
 def registry_columns(cfg: dict) -> dict[str, str]:
-    """The registry column names, as the config spells them.
+    """The table registry column names, as the config spells them.
 
     The extras are only there when the config names them; nothing breaks
     without one, the report simply says less.
@@ -578,6 +621,25 @@ def registry_columns(cfg: dict) -> dict[str, str]:
     cols = (cfg.get("oracle_meta") or {}).get("registry_columns") or {}
     wanted = REGISTRY_KEYS + tuple(k for k in REGISTRY_EXTRAS if cols.get(k))
     return {k: _oracle_ident(str(cols[k]), f"registry column {k}") for k in wanted}
+
+
+def source_columns(cfg: dict) -> dict[str, str]:
+    """The source registry column names, as the config spells them."""
+    cols = (cfg.get("oracle_meta") or {}).get("source_columns") or {}
+    return {k: _oracle_ident(str(cols[k]), f"source column {k}")
+            for k in SOURCE_KEYS}
+
+
+def framework_of(cfg: dict, source_type: str) -> tuple[str, str]:
+    """(framework, why there is none) for a source type from the registry."""
+    wanted = str(source_type or "").strip().lower()
+    if not wanted:
+        return "", "the source registry has no type for this source"
+    for framework, types in (cfg.get("frameworks") or {}).items():
+        if wanted in {str(t).strip().lower() for t in types or []}:
+            return str(framework).strip().lower(), ""
+    return "", (f"source type `{source_type}` is on none of the framework lists "
+                f"in the config")
 
 
 def cron_gap_hours(expr: str) -> float | None:
@@ -627,58 +689,81 @@ def as_schedule(raw: str) -> Schedule:
     return Schedule(cron=text, hours=hours)
 
 
-def read_schedules(cfg: dict, conn: Any, tables: list[str]) -> dict[str, Schedule]:
-    """The load schedule of each table, by upper-case table name.
+def read_registry(cfg: dict, conn: Any, tables: list[str]) -> dict[str, TableInfo]:
+    """What the metadata knows about each table, by upper-case table name.
 
-    A table with no row of its own is simply absent from the result - that is a
-    different thing from a row whose schedule is empty, and it reads differently
-    in the report.
+    One statement: the table registry carries the schedule and the source name,
+    the source registry turns that name into a type, and the type decides the
+    framework. Outer-joined, so a source that is not registered is told apart
+    from one whose type is simply blank.
+
+    A table with no row of its own is absent from the result - a different thing
+    from a row whose schedule is empty, and it reads differently in the report.
     """
     col = registry_columns(cfg)
-    extract = col.get("extract_method")
+    extract, source = col.get("extract_method"), col.get("source_name")
     binds = {f"t{i}": t.strip().upper()
              for i, t in enumerate(dict.fromkeys(tables))}
     placeholders = ", ".join(f":{name}" for name in binds)
-    sql = (f"SELECT {col['table_name']}, {col['cron_table']}"
-           + (f", {extract}" if extract else "") +
-           f" FROM {source_registry(cfg)} "
-           f"WHERE UPPER(TRIM({col['table_name']})) IN ({placeholders})")
+
+    fields = [f"t.{col['table_name']}", f"t.{col['cron_table']}",
+              f"t.{extract}" if extract else "NULL",
+              f"t.{source}" if source else "NULL"]
+    joined = ""
+    if source and cfg.get("frameworks"):
+        src = source_columns(cfg)
+        fields.append(f"s.{src['source_type']}")
+        joined = (f" LEFT JOIN {source_registry(cfg)} s "
+                  f"ON UPPER(TRIM(s.{src['source_name']})) "
+                  f"= UPPER(TRIM(t.{source}))")
+    else:
+        fields.append("NULL")
+
+    sql = (f"SELECT {', '.join(fields)} FROM {table_registry(cfg)} t{joined} "
+           f"WHERE UPPER(TRIM(t.{col['table_name']})) IN ({placeholders})")
     LOG.debug("Oracle SQL: %s  %s", sql, binds)
 
     with conn.cursor() as cur:
         cur.execute(sql, binds)
         rows = cur.fetchall()
 
-    schedules: dict[str, Schedule] = {}
-    for row in rows:
-        name, cron = row[0], row[1]
+    registry: dict[str, TableInfo] = {}
+    for name, cron, method, source_name, source_type in rows:
         key = str(_lob(name) or "").strip().upper()
-        found = as_schedule(str(_lob(cron) or ""))
-        found.extract = str(_lob(row[2]) or "").strip() if extract else ""
-        seen = schedules.get(key)
-        if seen and seen.cron != found.cron:
+        found = TableInfo(schedule=as_schedule(str(_lob(cron) or "")),
+                          extract=str(_lob(method) or "").strip(),
+                          source=str(_lob(source_name) or "").strip(),
+                          source_type=str(_lob(source_type) or "").strip())
+        found.framework, found.reason = framework_of(cfg, found.source_type)
+        seen = registry.get(key)
+        if seen and seen.schedule.cron != found.schedule.cron:
             # Two rows, two schedules: the first one wins, but say so out loud.
-            LOG.warning("  %s has more than one schedule in the registry (`%s` and "
-                        "`%s`) - using the first", key, seen.cron, found.cron)
+            LOG.warning("  %s has more than one row in the registry (`%s` and "
+                        "`%s`) - using the first", key, seen.schedule.cron,
+                        found.schedule.cron)
             continue
-        schedules[key] = found
-    return schedules
+        registry[key] = found
+    return registry
 
 
-def describe_schedules(tables: list[str], schedules: dict[str, Schedule]) -> str:
+def describe_registry(tables: list[str], registry: dict[str, TableInfo]) -> str:
     """One line on where the tested tables stand, so a gap is visible at once."""
     labels = {"cron": "from cron", "none": "without a schedule",
               "unreadable": "unreadable", "missing": "not in the registry"}
     counts: Counter[str] = Counter()
+    frameworks: Counter[str] = Counter()
     for table in tables:
-        found = schedules.get(table.strip().upper())
-        counts[found.state if found else "missing"] += 1
-    return ", ".join(f"{counts[state]} {label}"
+        found = registry.get(table.strip().upper())
+        counts[found.schedule.state if found else "missing"] += 1
+        frameworks[found.framework or "unknown" if found else "unknown"] += 1
+    seen = ", ".join(f"{counts[state]} {label}"
                      for state, label in labels.items() if counts[state])
+    return f"{seen} | frameworks: " + ", ".join(
+        f"{n} {name}" for name, n in frameworks.most_common())
 
 
 def tolerance_for(cfg: dict, case: TestCase,
-                  schedules: dict[str, Schedule]) -> tuple[float, str, str]:
+                  registry: dict[str, TableInfo]) -> tuple[float, str, str]:
     """(hours, where the hours came from, why this case cannot be run).
 
     Only the test cases named in cron_tolerance_cases get a tolerance at all -
@@ -690,17 +775,18 @@ def tolerance_for(cfg: dict, case: TestCase,
     if case.name.strip().upper() not in wanted:
         return 0.0, "", ""
 
-    found = schedules.get(case.table.strip().upper())
+    found = registry.get(case.table.strip().upper())
     if found is None:
-        return 0.0, "", (f"{case.table} has no row in the source registry - either "
+        return 0.0, "", (f"{case.table} has no row in the table registry - either "
                          f"it is not registered there, or the name is spelled "
                          f"differently; the tolerance cannot be worked out")
-    if found.hours is None:
-        return 0.0, "", found.reason
+    if found.schedule.hours is None:
+        return 0.0, "", found.schedule.reason
 
     buffer = float(cfg.get("tolerance_buffer_hours") or 0)
-    return (found.hours + buffer,
-            f"cron {found.cron} = {found.hours:g}h + {buffer:g}h buffer", "")
+    return (found.schedule.hours + buffer,
+            f"cron {found.schedule.cron} = {found.schedule.hours:g}h "
+            f"+ {buffer:g}h buffer", "")
 
 
 # --------------------------------------------------------------------------- #
@@ -765,6 +851,10 @@ class Diff:
     columns: list[str]
     only_oracle: list[tuple]
     only_gcp: list[tuple]
+    # The same counts the `actual` line words, for the results table.
+    identical: int = 0
+    discrepancies: int = 0
+    diff_columns: str = ""
 
 
 @dataclass
@@ -909,6 +999,58 @@ def reorder(rows: list[tuple], names: list[str], target: list[str]) -> list[tupl
     return [tuple(row[i] for i in order) for row in rows]
 
 
+PAIRING_LIMIT = 200          # above this, pairing costs more than it explains
+
+
+def _pair_rows(left: list[tuple], right: list[tuple]
+               ) -> tuple[list[tuple], list[tuple], list[tuple]]:
+    """(pairs, left-overs, right-overs) - nearest counterparts by similarity.
+
+    A guess, not a join: there is no key to join on. Two rows are called a pair
+    only when most of their columns agree, so a row that is genuinely missing
+    stays reported as missing instead of being read as a changed one.
+    """
+    if not left or not right or max(len(left), len(right)) > PAIRING_LIMIT:
+        return [], left, right
+
+    spare, pairs, lonely = list(right), [], []
+    for row in left:
+        near = min(spare, key=lambda r: _unlike(row, r), default=None)
+        if near is not None and _unlike(row, near) * 2 <= len(row):
+            spare.remove(near)
+            pairs.append((row, near))
+        else:
+            lonely.append(row)
+    return pairs, lonely, spare
+
+
+def _unlike(left: tuple, right: tuple) -> int:
+    return sum(1 for a, b in zip(left, right) if a != b)
+
+
+def _describe_diff(pairs: list[tuple], lone_left: list, lone_right: list,
+                   identical: int) -> str:
+    """The counts for `actual`: what matched, and how the rest did not."""
+    counts = [f"{identical:,} identical"]
+    if pairs:
+        counts.append(f"{len(pairs):,} discrepanc" + ("y" if len(pairs) == 1 else "ies"))
+    if lone_left:
+        counts.append(f"{len(lone_left):,} only in oracle")
+    if lone_right:
+        counts.append(f"{len(lone_right):,} only in gcp")
+    return ", ".join(counts)
+
+
+def _diff_columns(pairs: list[tuple], names: list[str]) -> str:
+    """Which columns the paired rows disagree on, and how often."""
+    tally: Counter[str] = Counter()
+    for left, right in pairs:
+        for i, (a, b) in enumerate(zip(left, right)):
+            if a != b:
+                tally[names[i] if i < len(names) else f"column {i + 1}"] += 1
+    return ", ".join(f"{name} ({n} of {len(pairs)})" for name, n in tally.most_common())
+
+
 def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int,
                   tolerance: float = 0, stamp_decimals: int = 6,
                   tolerance_note: str = "") -> tuple[str, str, str, Diff | None]:
@@ -992,17 +1134,19 @@ def compare_sides(oracle: SideResult, gcp: SideResult, decimals: int, limit: int
     only_gcp = Counter(gcp_rows) - Counter(ora_rows)
     left_n, right_n = sum(only_oracle.values()), sum(only_gcp.values())
     if not left_n and not right_n:
-        return with_note(PASS, rows_seen, "")
+        return with_note(PASS, rows_seen, "",
+                         Diff(columns=names or [str(c) for c in oracle.columns],
+                              only_oracle=[], only_gcp=[], identical=len(ora_rows)))
 
-    # Counts only - the rows themselves go to the CSV files under -v.
-    counted = ", ".join(part for part in (
-        f"{left_n:,} only in oracle" if left_n else "",
-        f"{right_n:,} only in gcp" if right_n else "") if part)
+    # Counts and the columns behind them; the rows go to the CSV files under -v.
     labels = names or [str(c) for c in oracle.columns]
+    left_rows, right_rows = list(only_oracle.elements()), list(only_gcp.elements())
+    pairs, lone_oracle, lone_gcp = _pair_rows(left_rows, right_rows)
+    counted = _describe_diff(pairs, lone_oracle, lone_gcp, len(ora_rows) - left_n)
     return with_note(FAIL, f"{rows_seen}, {counted}", "",
-                     Diff(columns=labels,
-                          only_oracle=list(only_oracle.elements()),
-                          only_gcp=list(only_gcp.elements())))
+                     Diff(columns=labels, only_oracle=left_rows, only_gcp=right_rows,
+                          identical=len(ora_rows) - left_n, discrepancies=len(pairs),
+                          diff_columns=_diff_columns(pairs, labels) if pairs else ""))
 
 
 def _file_name(text: str) -> str:
@@ -1032,6 +1176,12 @@ def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
     widths = [max(len(str(r[i])) for r in shown) for i in range(len(shown[0]))]
     LOG.debug("  %s / %s - differing rows: %d oracle, %d gcp",
               case.table, case.name, len(sides["oracle"]), len(sides["gcp"]))
+
+    # Which columns the near-matching rows disagree on, so the cause is visible.
+    pairs, _, _ = _pair_rows(sides["oracle"], sides["gcp"])
+    if pairs:
+        LOG.debug("    discrepancies in: %s (paired by similarity, not by key)",
+                  _diff_columns(pairs, diff.columns))
     for row in shown:
         LOG.debug("    " + "  ".join(str(v).ljust(w) for v, w in zip(row, widths)))
 
@@ -1050,7 +1200,7 @@ def show_diff(case: TestCase, diff: Diff, out_dir: str, stamp: str,
 
 
 def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
-                  schedules: dict[str, Schedule], last_run: LastRun,
+                  registry: dict[str, TableInfo], last_run: LastRun,
                   date_from: str, date_to: str, rep: TableReport,
                   out_dir: str = ".", stamp: str = "") -> None:
     decimals = int(cfg["defaults"]["float_decimals"])
@@ -1062,8 +1212,26 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
                 details=f"the catalogue has no {missing} for this test case")
         return
 
+    # A table the metadata calls someone else's is not ours to compare.
+    found = registry.get(case.table.strip().upper())
+    if cfg.get("frameworks"):
+        can = {str(f).strip().lower()
+               for f in (cfg.get("implemented_frameworks") or [])}
+        if found is None:
+            why = f"{case.table} has no row in the table registry"
+        elif found.reason:
+            why = found.reason
+        elif found.framework not in can:
+            why = (f"{case.table} is loaded by {found.framework}, and only "
+                   f"{', '.join(sorted(can)) or 'nothing'} is implemented")
+        else:
+            why = ""
+        if why:
+            rep.add("Test cases", case.name, SKIP, details=why)
+            return
+
     # First: a case that cannot be judged is not worth paying BigQuery for.
-    tolerance, tolerance_note, no_schedule = tolerance_for(cfg, case, schedules)
+    tolerance, tolerance_note, no_schedule = tolerance_for(cfg, case, registry)
     if no_schedule:
         rep.add("Test cases", case.name, SKIP, details=no_schedule)
         return
@@ -1084,12 +1252,14 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
         sql_gcp = bind_last_run(sql_gcp, last_run.stamp)
 
     LOG.info("Running test case %s / %s", case.table, case.name)
+    started = time.perf_counter()
     oracle = run_oracle(source, sql_oracle, limit)
     gcp = run_gcp(bq, sql_gcp, limit)
 
     status, actual, details, diff = compare_sides(
         oracle, gcp, decimals, limit, tolerance,
         int(cfg["defaults"]["timestamp_decimals"]), tolerance_note)
+    took = time.perf_counter() - started
     # With -v, the rows themselves, for reading side by side.
     if diff and LOG.isEnabledFor(logging.DEBUG):
         show_diff(case, diff, out_dir, stamp)
@@ -1102,7 +1272,17 @@ def run_test_case(bq: BQ, source: Any, cfg: dict, case: TestCase,
         details = (details + "; " if details else "") + \
             f"no date parameter in {side} - the window was not applied there"
     rep.add("Test cases", case.name, status,
-            expected="oracle = gcp", actual=actual, details=details)
+            expected="oracle = gcp", actual=actual, details=details,
+            load_type=found.extract if found else "",
+            cron=found.schedule.cron if found else "",
+            tolerance_h=tolerance,
+            last_load_at=last_run.stamp if bounded else "",
+            rows_source=len(oracle.rows) if not oracle.error else None,
+            rows_target=len(gcp.rows) if not gcp.error else None,
+            rows_identical=diff.identical if diff else None,
+            rows_discrepancies=diff.discrepancies if diff else None,
+            diff_columns=diff.diff_columns if diff else "",
+            duration_s=round(took, 2))
 
 
 # --------------------------------------------------------------------------- #
@@ -1452,6 +1632,135 @@ def render_text(reports: list[TableReport], cfg: dict, window: str) -> str:
     return "\n".join(out)
 
 
+# --------------------------------------------------------------------------- #
+# 5b) Results in the metadata database
+# --------------------------------------------------------------------------- #
+
+_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+def layer_of(dataset: str, layer_prefixes: Any) -> str:
+    """The layer a dataset name carries: bronze_sys -> BRONZE."""
+    name = (dataset or "").upper()
+    for prefix in layer_prefixes or []:
+        prefix = str(prefix).upper()
+        if prefix and name.startswith(prefix):
+            return prefix.rstrip("_")
+    return ""
+
+
+def _fit(text: Any, size: int) -> Any:
+    """Cut to what the column takes, counting bytes the way Oracle does."""
+    if text is None or text == "":
+        return None
+    return str(text).encode("utf-8")[:size].decode("utf-8", "ignore")
+
+
+def _column_prefix(value: Any, what: str) -> str:
+    prefix = str(value or "")
+    if prefix and not _PREFIX.match(prefix):
+        raise ValueError(f"{what} is not a usable column prefix: {prefix!r}")
+    return prefix
+
+
+def _as_date(value: str) -> Any:
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _as_stamp(value: str) -> Any:
+    try:
+        return datetime.strptime(str(value).strip(), RUN_STAMP_FORMAT)
+    except (ValueError, TypeError):
+        return None
+
+
+def save_results(cfg: dict, conn: Any, rep: TableReport, info: TableInfo | None,
+                 layer: str, date_from: str, date_to: str) -> None:
+    """Write one table's report into the two metadata tables.
+
+    The tests are the point; the record of them is not. Anything that goes
+    wrong here is reported and swallowed, so a run still finishes.
+    """
+    res = cfg.get("results") or {}
+    if not res.get("enabled"):
+        return
+    if not info or not info.framework:
+        # The framework column is NOT NULL and the metadata did not say.
+        LOG.warning("  results not saved for %s: %s", rep.table,
+                    info.reason if info else "no row in the table registry")
+        return
+
+    runs = _oracle_ident(str(res.get("runs_table") or ""), "results.runs_table")
+    rows = _oracle_ident(str(res.get("results_table") or ""), "results.results_table")
+    head = _column_prefix(res.get("runs_column_prefix"), "results.runs_column_prefix")
+    line = _column_prefix(res.get("results_column_prefix"),
+                          "results.results_column_prefix")
+
+    # DEFAULTs only fire when the column is absent, so the id ones stay out.
+    header = (
+        f"INSERT INTO {runs} ({head}FRAMEWORK, {head}ENVIRONMENT, {head}LAYER, "
+        f"{head}SOURCE_TESTED, {head}TABLE_TESTED, {head}STARTED_AT, "
+        f"{head}FINISHED_AT, {head}WINDOW_FROM, {head}WINDOW_TO, {head}RUN_BY, "
+        f"{head}STATUS) "
+        f"VALUES (:framework, :environment, :layer, :source, :table_name, "
+        f":started, :finished, :win_from, :win_to, :run_by, :status) "
+        f"RETURNING {head}ID INTO :run_id")
+
+    with conn.cursor() as cur:
+        run_id = cur.var(int)
+        cur.execute(header, {
+            "framework": info.framework,
+            "environment": str(res.get("environment") or "").strip().upper(),
+            "layer": _fit(layer.upper(), 20),
+            "source": _fit(info.source, 128),
+            "table_name": _fit(rep.table, 256),
+            "started": rep.started_at.replace(tzinfo=None),
+            "finished": rep.finished_at.replace(tzinfo=None) if rep.finished_at else None,
+            "win_from": _as_date(date_from),
+            "win_to": _as_date(date_to),
+            "run_by": _fit(getpass.getuser(), 64),
+            "status": rep.final_status,
+            "run_id": run_id,
+        })
+        taken = run_id.getvalue()
+        parent = taken[0] if isinstance(taken, list) else taken
+
+        detail = (
+            f"INSERT INTO {rows} ({line}{head}ID, {line}SECTION, {line}TEST_CASE, "
+            f"{line}STATUS, {line}LOAD_TYPE, {line}CRON, {line}TOLERANCE_H, "
+            f"{line}LAST_LOAD_AT, {line}ROWS_SOURCE, {line}ROWS_TARGET, "
+            f"{line}ROWS_IDENTICAL, {line}ROWS_DISCREPANCIES, {line}DIFF_COLUMNS, "
+            f"{line}EXPECTED, {line}ACTUAL, {line}DETAILS, {line}DURATION_S) "
+            f"VALUES (:parent, :section, :test_case, :status, :load_type, :cron, "
+            f":tolerance_h, :last_load_at, :rows_source, :rows_target, "
+            f":rows_identical, :rows_discrepancies, :diff_columns, :expected, "
+            f":actual, :details, :duration_s)")
+        cur.executemany(detail, [{
+            "parent": parent,
+            "section": _fit(r.section, 30),
+            "test_case": _fit(r.name, 128),
+            "status": r.status,
+            "load_type": _fit(r.load_type, 20),
+            "cron": _fit(r.cron, 100),
+            "tolerance_h": r.tolerance_h,
+            "last_load_at": _as_stamp(r.last_load_at),
+            "rows_source": r.rows_source,
+            "rows_target": r.rows_target,
+            "rows_identical": r.rows_identical,
+            "rows_discrepancies": r.rows_discrepancies,
+            "diff_columns": _fit(r.diff_columns, 1000),
+            "expected": _fit(r.expected, 400),
+            "actual": _fit(r.actual, 1000),
+            "details": _fit(r.details, 2000),
+            "duration_s": r.duration_s,
+        } for r in rep.results])
+    conn.commit()
+    LOG.info("  results saved: run %s, %d checks", parent, len(rep.results))
+
+
 def write_report(reports: list[TableReport], cfg: dict, window: str,
                  out_dir: str, stamp: str) -> str:
     path = os.path.join(out_dir, f"bronze_test_{stamp}.txt")
@@ -1624,18 +1933,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- How often those tables are loaded ---------------------------------- #
     # The registry is the only source; without one, those cases are skipped.
-    schedules: dict[str, Schedule] = {}
-    if cfg.get("cron_tolerance_cases"):
+    registry: dict[str, TableInfo] = {}
+    if cfg.get("cron_tolerance_cases") or cfg.get("frameworks"):
         if croniter is None:
             LOG.warning("croniter is not installed - no schedule can be read, so "
                         "the test cases needing one will be skipped")
         try:
-            schedules = read_schedules(cfg, meta, tables)
+            registry = read_registry(cfg, meta, tables)
         except Exception as exc:
-            LOG.error("Cannot read the load schedules: %s: %s",
+            LOG.error("Cannot read the table registry: %s: %s",
                       type(exc).__name__, exc)
-            LOG.error("Test cases that need one will be skipped.")
-        LOG.info("Schedules: %s", describe_schedules(tables, schedules))
+            LOG.error("Test cases that need it will be skipped.")
+        LOG.info("Registry: %s", describe_registry(tables, registry))
 
     # --- Which window ------------------------------------------------------- #
     if args.date_from or args.date_to:
@@ -1658,10 +1967,12 @@ def main(argv: list[str] | None = None) -> int:
     # --- Run ---------------------------------------------------------------- #
     reports = []
     for table in tables:
-        found = schedules.get(table.strip().upper())
+        found = registry.get(table.strip().upper())
         known = ", ".join(part for part in (
+            found.framework if found else "",
             found.extract if found else "",
-            f"cron {found.cron}" if found and found.cron else "") if part)
+            f"cron {found.schedule.cron}" if found and found.schedule.cron else "")
+            if part)
         rep = TableReport(table=table, started_at=now_local(), window=window,
                           load=found.extract if found else "")
         LOG.info("=" * 78)
@@ -1673,9 +1984,9 @@ def main(argv: list[str] | None = None) -> int:
         # The source schema for the dag_id only appears in the sql_gcp dataset.
         tc = table_config(cfg, table)
         af = cfg.get("airflow") or {}
+        dataset = next((d for d in (dataset_of(c.sql_gcp) for c in table_cases) if d),
+                       None)
         if not tc.get("dag_id") and not tc.get("dag_prefix"):
-            dataset = next((d for d in (dataset_of(c.sql_gcp) for c in table_cases) if d),
-                           None)
             if dataset:
                 tc["dag_prefix"] = dag_prefix_of(dataset, af.get("dataset_layer_prefixes"))
                 LOG.info("  dag_id from dataset %s: %s", dataset, dag_id_for(tc, af))
@@ -1690,7 +2001,7 @@ def main(argv: list[str] | None = None) -> int:
 
         for case in table_cases:
             try:
-                run_test_case(bq, source, cfg, case, schedules, last_run,
+                run_test_case(bq, source, cfg, case, registry, last_run,
                               date_from, date_to, rep, out_dir, stamp)
             except Exception as exc:
                 LOG.exception("Unexpected error in test case %s (%s)", case.name, table)
@@ -1706,6 +2017,14 @@ def main(argv: list[str] | None = None) -> int:
         rep.finished_at = now_local()
         LOG.info("FINAL STATUS for %s: %s", table, rep.final_status)
         reports.append(rep)
+
+        try:
+            save_results(cfg, meta, rep, found,
+                         layer=layer_of(dataset, af.get("dataset_layer_prefixes")),
+                         date_from=date_from, date_to=date_to)
+        except Exception as exc:
+            LOG.warning("  results not saved for %s: %s: %s",
+                        table, type(exc).__name__, exc)
 
     oracle_close_all()
     txt_path = write_report(reports, cfg, window, out_dir, stamp)
