@@ -11,10 +11,16 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .main import (FAIL, PASS, SKIP, CheckResult, TableReport, check_airflow,
-                   now_local)
+from .main import (FAIL, PASS, SKIP, WARN, CheckResult, TableReport,
+                   check_airflow, now_local)
+
+try:
+    from google.cloud import storage
+except ImportError:  # pragma: no cover
+    storage = None
 
 LOG = logging.getLogger("loading_tests")
 
@@ -219,6 +225,122 @@ def check_last_insert(bq: Any, project: str, dataset: str, table: str,
         last_load_at=str(newest), tolerance_h=max_age, duration_s=took)
 
 
+# --------------------------------------------------------------------------- #
+# What the validator threw out, told by the folders it leaves behind
+# --------------------------------------------------------------------------- #
+
+# run_id=scheduled__2026-09-07T07:15:00+00:00, and the manual spelling too.
+_RUN_STAMP = re.compile(r"__(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?"
+                        r"(?:Z|[+-]\d{2}:\d{2})?)$")
+
+
+def run_age(folder: str) -> datetime | None:
+    """When the run behind a folder name started, or None when it says nothing."""
+    match = _RUN_STAMP.search(folder)
+    if not match:
+        return None
+    try:
+        stamp = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def folders(client: Any, bucket: str, prefix: str) -> set[str]:
+    """The folder names directly under a prefix, without listing what is in them.
+
+    A delimiter makes the API answer with prefixes instead of every object, so
+    this stays cheap however many files a run wrote.
+    """
+    listing = client.list_blobs(bucket, prefix=prefix, delimiter="/")
+    for _ in listing:                    # the prefixes only fill in once read
+        pass
+    return {p[len(prefix):].strip("/") for p in (listing.prefixes or set())}
+
+
+def _gcs_paths(cfg: dict, system: str, table: str) -> dict[str, str]:
+    gcs = (cfg.get("standalone") or {}).get("gcs") or {}
+    # Bucket names cannot hold a capital, and the tree under them has none either.
+    env = str((cfg.get("results") or {}).get("environment") or "").lower()
+    fill = {"env": env, "system": system.lower(), "table": table.lower()}
+    return {key: str(gcs.get(key) or "").format(**fill)
+            for key in ("bucket_pattern", "archive_prefix", "invalid_prefix",
+                        "valid_prefix")}
+
+
+def check_validator(client: Any, cfg: dict, system: str,
+                    table: str) -> list[CheckResult]:
+    """Which runs the validator rejected, and which produced nothing at all.
+
+    The archive holds one folder per run, so it is the list of runs that ever
+    happened. A folder of the same name under invalid/ means that run wrote
+    rejected records; none under valid/ means it wrote nothing usable.
+    """
+    gcs = (cfg.get("standalone") or {}).get("gcs") or {}
+    days = int(gcs.get("days", 10))
+    path = _gcs_paths(cfg, system, table)
+    bucket = path["bucket_pattern"]
+
+    started = time.perf_counter()
+    seen = folders(client, bucket, path["archive_prefix"])
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    runs = {name for name in seen if (run_age(name) or since) >= since}
+    took = round(time.perf_counter() - started, 2)
+
+    where = f"gs://{bucket}/{path['archive_prefix']}"
+    if not runs:
+        told = (f"no run folder from the last {days} days under {where}"
+                if not seen else
+                f"{len(seen)} run folders under {where}, none from the last {days} days")
+        return [CheckResult(section="Test cases", name=name, status=SKIP,
+                            details=told, duration_s=took)
+                for name in ("REJECTED_RECORDS", "VALID_RECORDS")]
+
+    rejected = runs & folders(client, bucket, path["invalid_prefix"])
+    accepted = runs & folders(client, bucket, path["valid_prefix"])
+    empty = runs - accepted
+    took = round(time.perf_counter() - started, 2)
+
+    return [
+        CheckResult(
+            section="Test cases", name="REJECTED_RECORDS",
+            status=FAIL if rejected else PASS,
+            expected=f"no rejected records in {len(runs)} runs",
+            actual=f"{len(rejected)} of {len(runs)} runs rejected records",
+            details="; ".join(sorted(rejected)[:5]) if rejected else "",
+            rows_target=len(rejected), duration_s=took),
+        CheckResult(
+            section="Test cases", name="VALID_RECORDS",
+            status=WARN if empty else PASS,
+            expected=f"accepted records in all {len(runs)} runs",
+            actual=f"{len(accepted)} of {len(runs)} runs wrote accepted records",
+            details="; ".join(sorted(empty)[:5]) if empty else "",
+            rows_target=len(accepted), duration_s=took),
+    ]
+
+
+def validator_checks(cfg: dict, system: str, table: str) -> list[CheckResult]:
+    """The validator checks, or one SKIP saying why they could not be made."""
+    gcs = (cfg.get("standalone") or {}).get("gcs") or {}
+    if not gcs.get("bucket_pattern"):
+        return []
+    if not str(table).lower().endswith(str(gcs.get("only_suffix") or "_raw")):
+        return []                        # only the tables the validator writes
+
+    if storage is None:
+        why = "google-cloud-storage is not installed"
+    else:
+        why = ""
+    if not why:
+        try:
+            client = storage.Client(project=gcs.get("project") or None)
+            return check_validator(client, cfg, system, table)
+        except Exception as exc:
+            why = f"{type(exc).__name__}: {exc}"
+    return [CheckResult(section="Test cases", name=name, status=SKIP, details=why)
+            for name in ("REJECTED_RECORDS", "VALID_RECORDS")]
+
+
 def test_table(bq: Any, cfg: dict, project: str, dataset: str, table: str,
                columns: list[tuple], layer: str, system: str) -> TableReport:
     """Both checks for one table, in a report shaped like every other one."""
@@ -236,10 +358,12 @@ def test_table(bq: Any, cfg: dict, project: str, dataset: str, table: str,
     LOG.info("  %s", _measured_by(col))
     hours = int(own.get("hours", 24))
     zone = _zone(own.get("timezone") or "UTC")
-    for check in (check_rows_last_hours(bq, project, dataset, table, col, hours,
-                                        int(own.get("min_rows", 1)), zone),
-                  check_last_insert(bq, project, dataset, table, col,
-                                    float(own.get("max_age_hours", hours)), zone)):
+    checks = [check_rows_last_hours(bq, project, dataset, table, col, hours,
+                                    int(own.get("min_rows", 1)), zone),
+              check_last_insert(bq, project, dataset, table, col,
+                                float(own.get("max_age_hours", hours)), zone)]
+    checks += validator_checks(cfg, system, table)
+    for check in checks:
         rep.results.append(check)
         LOG.info("[%s] %-38s %-7s %s", check.section, check.name, check.status,
                  check.actual or check.details)

@@ -72,6 +72,16 @@ standalone:
   # Fallback for tables not partitioned by time. Usually left empty: the
   # partitioning column is asked for first and no two tables need to agree.
   loaded_at_columns: []
+  # What the validator left behind, one folder per run. Drop bucket_pattern to
+  # skip these checks. {env} comes from results.environment, in lower case.
+  gcs:
+    project: RAW_DATA_PROJECT
+    bucket_pattern: "BUCKET-{env}-{system}"
+    archive_prefix: "archive/GROUP_{system}/{table}/"
+    invalid_prefix: "data/GROUP_{system}/{table}/invalid/"
+    valid_prefix: "data/GROUP_{system}/{table}/valid/"
+    only_suffix: _raw
+    days: 10
 
 # Where results go, on the oracle_meta connection. Off until the user has INSERT.
 results:
