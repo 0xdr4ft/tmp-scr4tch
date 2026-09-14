@@ -248,17 +248,63 @@ def last_load(cfg: dict, dag: str) -> LoadRun:
                    or _parse_ts(ti.get("start_date")), run_id=run_id, task=task)
 
 
-def _after(col: TimeColumn, since: datetime, zone: str) -> str:
-    """Rows from that load on, in whatever terms the column can answer."""
+def _boundary(col: TimeColumn, since: datetime, zone: str) -> str:
+    """A moment, spelled in whatever terms the column can be compared in."""
     moment = f"TIMESTAMP '{since.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S}+00'"
     if col.kind == "DATE":
-        return f"{col.name} >= DATE({moment}, '{zone}')"
+        return f"DATE({moment}, '{zone}')"
     if col.kind == "DATETIME":
-        return f"{col.name} >= DATETIME({moment}, '{zone}')"
+        return f"DATETIME({moment}, '{zone}')"
     if col.name.upper().startswith("_PARTITION"):
         # Ingestion time is cut to the partition, so the run's rows sit earlier.
-        return f"{col.name} >= TIMESTAMP_TRUNC({moment}, DAY)"
-    return f"{col.name} >= {moment}"
+        return f"TIMESTAMP_TRUNC({moment}, DAY)"
+    return moment
+
+
+def _shown(value: Any) -> str:
+    """A value from BigQuery in the zone the rest of the report speaks."""
+    if isinstance(value, datetime) and value.tzinfo:
+        value = value.astimezone(LOCAL_TZ) if LOCAL_TZ else value
+    return f"{value:%Y-%m-%d %H:%M:%S}" if isinstance(value, datetime) else str(value)
+
+
+def _after(col: TimeColumn, since: datetime, zone: str) -> str:
+    """Rows from that load on, in whatever terms the column can answer."""
+    return f"{col.name} >= {_boundary(col, since, zone)}"
+
+
+def check_last_insert_since_load(bq: Any, project: str, dataset: str, table: str,
+                                 col: TimeColumn, load: LoadRun, slack: float,
+                                 zone: str) -> CheckResult:
+    """Whether the newest row came with the last load, not before it.
+
+    Compared with the load and not with now: a DAG that had nothing to take in
+    for a week has a week-old newest row, and that is not a fault.
+    """
+    if load.started is None:
+        return CheckResult(section="Test cases", name="LAST_INSERT_AT",
+                           status=SKIP, details=load.reason)
+    since = load.started - timedelta(hours=slack)
+    sql = (f"SELECT MAX({col.name}) AS last_insert, "
+           f"MAX({col.name}) >= {_boundary(col, since, zone)} AS with_load "
+           f"FROM `{project}.{dataset}.{table}`")
+    started = time.perf_counter()
+    _, rows, _ = bq.rows(sql, 1)
+    newest, with_load = (rows[0] if rows else (None, None))
+    took = round(time.perf_counter() - started, 2)
+
+    local = load.started.astimezone(LOCAL_TZ) if LOCAL_TZ else load.started
+    told = f"{_measured_by(col)}; load = {load.run_id}"
+    if col.kind == "DATE":
+        told += "; a date column only tells the day"
+    return CheckResult(
+        section="Test cases", name="LAST_INSERT_AT",
+        status=PASS if with_load else FAIL,
+        expected=f"newest row not before the last load (-{slack:g}h)",
+        actual=(f"{_shown(newest)} (last load {local:%Y-%m-%d %H:%M:%S})"
+                if newest is not None else "the table is empty"),
+        details=told, last_load_at=f"{local:%Y-%m-%d %H:%M:%S}",
+        tolerance_h=slack, duration_s=took)
 
 
 def check_rows_since_load(bq: Any, project: str, dataset: str, table: str,
@@ -476,6 +522,9 @@ def test_table(bq: Any, cfg: dict, project: str, dataset: str, table: str,
     checks = [check_rows_since_load(bq, project, dataset, table, col, load, least, zone)
               if load else
               check_rows_last_hours(bq, project, dataset, table, col, hours, least, zone),
+              check_last_insert_since_load(bq, project, dataset, table, col, load,
+                                           float(own.get("load_slack_hours", 2)), zone)
+              if load else
               check_last_insert(bq, project, dataset, table, col,
                                 float(own.get("max_age_hours", hours)), zone)]
     checks += validator_checks(cfg, system, table)
