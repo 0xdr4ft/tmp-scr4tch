@@ -13,9 +13,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
-from .main import (FAIL, PASS, SKIP, WARN, CheckResult, TableReport,
-                   check_airflow, now_local)
+from .main import (FAIL, LOCAL_TZ, PASS, SKIP, WARN, CheckResult, TableReport,
+                   _parse_ts, airflow_api, check_airflow, now_local)
 
 try:
     from google.cloud import storage
@@ -174,6 +175,113 @@ def _age_minutes(col: TimeColumn, zone: str) -> str:
 
 def _measured_by(col: TimeColumn) -> str:
     return f"measured on {col.name} ({col.kind}, from the {col.chosen})"
+
+
+@dataclass
+class LoadRun:
+    """The most recent DAG run that actually loaded, or why there is none."""
+    started: datetime | None = None
+    run_id: str = ""
+    task: str = ""
+    reason: str = ""
+
+
+def final_task(get: Any, dag: str) -> tuple[str, str]:
+    """(the task nothing runs after, why there is no single one)."""
+    tasks = get(f"/dags/{quote(dag, safe='')}/tasks").get("tasks", [])
+    leaves = [t["task_id"] for t in tasks if not t.get("downstream_task_ids")]
+    if len(leaves) == 1:
+        return leaves[0], ""
+    return "", (f"{dag} ends in {len(leaves)} tasks ({', '.join(leaves) or 'none'}), "
+                f"so there is no single final task to read an ingest from")
+
+
+def newest_success(get: Any, path: str, task: str,
+                   cutoff: datetime) -> tuple[dict | None, str]:
+    """(the newest successful instance of `task`, why it cannot be trusted).
+
+    One call over every run at once: Airflow filters in its own database, so how
+    many empty runs came before the ingest does not change what is asked.
+    """
+    data = get(f"{path}/dagRuns/~/taskInstances", task_id=task, state="success",
+               order_by="-start_date", limit=100,
+               start_date_gte=f"{cutoff.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
+    found = data.get("task_instances", [])
+    mine = [t for t in found if t.get("task_id") == task and t.get("state") == "success"]
+    if found and not mine:
+        # Instances of other tasks came back: the filters were not applied.
+        return None, f"Airflow ignored the task_id and state filters for {task}"
+    return (max(mine, key=lambda t: t.get("start_date") or "") if mine else None), ""
+
+
+def last_load(cfg: dict, dag: str) -> LoadRun:
+    """The newest run whose final task succeeded: an ingest, not an empty run.
+
+    The DAG succeeds either way; only its final task tells the two apart, being
+    skipped when there was nothing to take in.
+    """
+    own = cfg.get("standalone") or {}
+    get, why = airflow_api(cfg)
+    if get is None:
+        return LoadRun(reason=why)
+
+    days = int(own.get("lookback_days", 30))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    path = f"/dags/{quote(dag, safe='')}"
+    try:
+        task, why = final_task(get, dag)
+        if not task:
+            return LoadRun(reason=why)
+
+        ti, why = newest_success(get, path, task, cutoff)
+        if why:
+            return LoadRun(task=task, reason=why)
+        if not ti:
+            return LoadRun(task=task, reason=f"{task} of {dag} has not succeeded "
+                                             f"in the last {days} days")
+        run_id = ti.get("dag_run_id") or ""
+        run = get(f"{path}/dagRuns/{quote(run_id, safe='')}")
+    except Exception as exc:
+        return LoadRun(reason=f"the runs of {dag} could not be read: {exc}")
+
+    return LoadRun(started=_parse_ts(run.get("start_date"))
+                   or _parse_ts(ti.get("start_date")), run_id=run_id, task=task)
+
+
+def _after(col: TimeColumn, since: datetime, zone: str) -> str:
+    """Rows from that load on, in whatever terms the column can answer."""
+    moment = f"TIMESTAMP '{since.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S}+00'"
+    if col.kind == "DATE":
+        return f"{col.name} >= DATE({moment}, '{zone}')"
+    if col.kind == "DATETIME":
+        return f"{col.name} >= DATETIME({moment}, '{zone}')"
+    if col.name.upper().startswith("_PARTITION"):
+        # Ingestion time is cut to the partition, so the run's rows sit earlier.
+        return f"{col.name} >= TIMESTAMP_TRUNC({moment}, DAY)"
+    return f"{col.name} >= {moment}"
+
+
+def check_rows_since_load(bq: Any, project: str, dataset: str, table: str,
+                          col: TimeColumn, load: LoadRun, least: int,
+                          zone: str) -> CheckResult:
+    """Whether the last run that loaded left rows behind."""
+    if load.started is None:
+        return CheckResult(section="Test cases", name="ROWS_SINCE_LAST_LOAD",
+                           status=SKIP, details=load.reason)
+    sql = (f"SELECT COUNT(*) AS n FROM `{project}.{dataset}.{table}` "
+           f"WHERE {_after(col, load.started, zone)}")
+    started = time.perf_counter()
+    _, rows, _ = bq.rows(sql, 1)
+    loaded = int(rows[0][0]) if rows else 0
+    local = load.started.astimezone(LOCAL_TZ) if LOCAL_TZ else load.started
+    return CheckResult(
+        section="Test cases", name="ROWS_SINCE_LAST_LOAD",
+        status=PASS if loaded >= least else FAIL,
+        expected=f">= {least:,} rows since the last successful load",
+        actual=f"{loaded:,} rows since {local:%Y-%m-%d %H:%M}",
+        details=f"{_measured_by(col)}; load = {load.run_id} ({load.task} succeeded)",
+        last_load_at=f"{local:%Y-%m-%d %H:%M:%S}", rows_target=loaded,
+        duration_s=round(time.perf_counter() - started, 2))
 
 
 def check_rows_last_hours(bq: Any, project: str, dataset: str, table: str,
@@ -342,14 +450,20 @@ def validator_checks(cfg: dict, system: str, table: str) -> list[CheckResult]:
 
 
 def test_table(bq: Any, cfg: dict, project: str, dataset: str, table: str,
-               columns: list[tuple], layer: str, system: str) -> TableReport:
-    """Both checks for one table, in a report shaped like every other one."""
+               columns: list[tuple], layer: str, system: str,
+               load: LoadRun | None = None) -> TableReport:
+    """Every check for one table, in a report shaped like every other one.
+
+    With a DAG to ask, rows are counted from its last successful load; without
+    one, over the last hours in the config, as before.
+    """
     own = cfg.get("standalone") or {}
     rep = TableReport(table=f"{dataset}.{table}", started_at=now_local())
+    rows_check = "ROWS_SINCE_LAST_LOAD" if load else "ROWS_LAST_HOURS"
 
     col = time_column(columns, own.get("loaded_at_columns") or [])
     if not col.name:
-        for name in ("ROWS_LAST_HOURS", "LAST_INSERT_AT"):
+        for name in (rows_check, "LAST_INSERT_AT"):
             rep.add("Test cases", name, SKIP,
                     details=f"nothing to measure {table} by: {col.reason}")
         rep.finished_at = now_local()
@@ -358,8 +472,10 @@ def test_table(bq: Any, cfg: dict, project: str, dataset: str, table: str,
     LOG.info("  %s", _measured_by(col))
     hours = int(own.get("hours", 24))
     zone = _zone(own.get("timezone") or "UTC")
-    checks = [check_rows_last_hours(bq, project, dataset, table, col, hours,
-                                    int(own.get("min_rows", 1)), zone),
+    least = int(own.get("min_rows", 1))
+    checks = [check_rows_since_load(bq, project, dataset, table, col, load, least, zone)
+              if load else
+              check_rows_last_hours(bq, project, dataset, table, col, hours, least, zone),
               check_last_insert(bq, project, dataset, table, col,
                                 float(own.get("max_age_hours", hours)), zone)]
     checks += validator_checks(cfg, system, table)
@@ -393,16 +509,25 @@ def run_system(bq: Any, cfg: dict, system: str, layer: str) -> list[TableReport]
         f"{t} -> {c.name or 'nothing: ' + c.reason}"
         for t in tables for c in [time_column(columns.get(t, []), named)]))
 
+    # One DAG loads the whole layer: its last real load is the same for every table.
+    dag = dag_for(cfg, layer, system)
+    # With Airflow switched off there is nothing to ask, so the hours window stays.
+    load = last_load(cfg, dag) if dag and airflow_api(cfg)[0] is not None else None
+    if load and load.started:
+        local = load.started.astimezone(LOCAL_TZ) if LOCAL_TZ else load.started
+        LOG.info("Last load: %s, run %s (%s succeeded) - rows are counted from here",
+                 f"{local:%Y-%m-%d %H:%M:%S}", load.run_id, load.task)
+    elif load:
+        LOG.info("Last load: not found - %s", load.reason)
+
     reports = []
     for table in tables:
         LOG.info("=" * 78)
         LOG.info("Testing table: %s.%s", dataset, table)
         LOG.info("=" * 78)
         reports.append(test_table(bq, cfg, project, dataset, table,
-                                  columns.get(table, []), layer, system))
+                                  columns.get(table, []), layer, system, load))
 
-    # One DAG loads the whole layer, so its checks are not any one table's.
-    dag = dag_for(cfg, layer, system)
     if dag:
         LOG.info("=" * 78)
         LOG.info("Airflow DAG: %s", dag)

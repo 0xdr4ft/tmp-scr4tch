@@ -66,6 +66,7 @@ standalone:
   table_suffixes: [_raw, _std]
   dag_pattern: "{layer}_{system}_LOAD"  # one DAG per layer and system; "" to skip
   dag_lowercase: true
+  lookback_days: 30                     # how far back to look for the last load
   hours: 24                             # the window for ROWS_LAST_HOURS
   min_rows: 1                           # fewer than this in the window is a FAIL
   max_age_hours: 24                     # newest row older than this is a FAIL
