@@ -427,49 +427,52 @@ def check_validator(client: Any, cfg: dict, system: str,
     """Which runs the validator rejected, and which produced nothing at all.
 
     The archive holds one folder per run, so it is the list of runs that ever
-    happened. A folder of the same name under invalid/ means that run wrote
-    rejected records; none under valid/ means it wrote nothing usable.
+    happened; only the newest few are judged. A folder of the same name under
+    invalid/ means that run wrote rejected records; none under valid/ means it
+    wrote nothing usable.
     """
     gcs = (cfg.get("standalone") or {}).get("gcs") or {}
-    days = int(gcs.get("days", 10))
+    count = int(gcs.get("last_runs", 10))
     path = _gcs_paths(cfg, system, table)
     bucket = path["bucket_pattern"]
 
     started = time.perf_counter()
     seen = folders(client, bucket, path["archive_prefix"])
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    runs = {name for name in seen if (run_age(name) or since) >= since}
+    # Newest first by the run's timestamp; a name without one cannot be placed.
+    dated = sorted(((run_age(name), name) for name in seen if run_age(name)),
+                   reverse=True)
+    runs = [name for _, name in dated[:count]]
     took = round(time.perf_counter() - started, 2)
 
     where = f"gs://{bucket}/{path['archive_prefix']}"
     if not runs:
-        told = (f"no run folder from the last {days} days under {where}"
-                if not seen else
-                f"{len(seen)} run folders under {where}, none from the last {days} days")
+        told = (f"no run folder under {where}" if not seen else
+                f"{len(seen)} folders under {where}, none named like a run")
         return [CheckResult(section="Test cases", name=name, status=SKIP,
                             details=told, duration_s=took)
                 for name in ("REJECTED_RECORDS", "VALID_RECORDS")]
 
-    rejected = runs & folders(client, bucket, path["invalid_prefix"])
-    accepted = runs & folders(client, bucket, path["valid_prefix"])
-    empty = runs - accepted
+    invalid = folders(client, bucket, path["invalid_prefix"])
+    valid = folders(client, bucket, path["valid_prefix"])
+    rejected = [run for run in runs if run in invalid]
+    empty = [run for run in runs if run not in valid]
     took = round(time.perf_counter() - started, 2)
 
     return [
         CheckResult(
             section="Test cases", name="REJECTED_RECORDS",
             status=FAIL if rejected else PASS,
-            expected=f"no rejected records in {len(runs)} runs",
-            actual=f"{len(rejected)} of {len(runs)} runs rejected records",
-            details="; ".join(sorted(rejected)[:5]) if rejected else "",
-            rows_target=len(rejected), duration_s=took),
+            expected=f"no rejected records in the last {len(runs)} runs",
+            actual=f"{len(rejected)} of the last {len(runs)} runs rejected records",
+            details="; ".join(rejected), rows_target=len(rejected), duration_s=took),
         CheckResult(
             section="Test cases", name="VALID_RECORDS",
             status=WARN if empty else PASS,
-            expected=f"accepted records in all {len(runs)} runs",
-            actual=f"{len(accepted)} of {len(runs)} runs wrote accepted records",
-            details="; ".join(sorted(empty)[:5]) if empty else "",
-            rows_target=len(accepted), duration_s=took),
+            expected=f"accepted records in each of the last {len(runs)} runs",
+            actual=(f"{len(runs) - len(empty)} of the last {len(runs)} runs "
+                    f"wrote accepted records"),
+            details="; ".join(empty), rows_target=len(runs) - len(empty),
+            duration_s=took),
     ]
 
 

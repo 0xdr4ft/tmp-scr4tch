@@ -83,7 +83,7 @@ standalone:
     invalid_prefix: "data/GROUP_{system}/{table}/invalid/"
     valid_prefix: "data/GROUP_{system}/{table}/valid/"
     only_suffix: _raw
-    days: 10
+    last_runs: 10                       # only the newest runs are judged
 
 # Where results go, on the oracle_meta connection. Off until the user has INSERT.
 results:
